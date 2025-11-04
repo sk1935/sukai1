@@ -1,0 +1,197 @@
+"""
+世界情绪引擎
+
+功能：
+- 从 news_cache.json 读取新闻数据
+- 计算全球舆情温度 (World Temperature Index)
+- 统计情绪分布
+- 计算趋势（上升/下降/稳定）
+"""
+import json
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from typing import Dict, Optional, List
+import sys
+
+# 添加项目根目录到路径
+project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(project_root))
+
+# 相对导入（同目录）
+from src.news_cache import CACHE_FILE, load_cache
+
+WORLD_SENTIMENT_ENABLED = False  # Stability mode toggle
+
+
+def compute_world_temperature() -> Optional[Dict]:
+    """
+    计算全球舆情温度
+    
+    公式: WTI = (正面 - 负面) / 总样本 × 100
+    
+    Returns:
+        Dict: {
+            "world_temp": float,  # 世界温度指数，范围 [-100, 100]
+            "trend": str,         # "rising", "falling", "stable"
+            "sentiment_distribution": {
+                "pos": int,       # 正面新闻数量
+                "neg": int,       # 负面新闻数量
+                "neu": int        # 中性新闻数量
+            }
+        }
+        如果缓存为空，返回 None
+    """
+    if not WORLD_SENTIMENT_ENABLED:
+        print("🛑 [WORLD_SENTIMENT] 功能已禁用，跳过世界温度计算")
+        return None
+    try:
+        # 加载缓存
+        cached_data = load_cache()
+        
+        if not cached_data or not cached_data.get("news"):
+            print("⚠️ 新闻缓存为空，无法计算世界温度")
+            return None
+        
+        news_list = cached_data["news"]
+        
+        if not news_list:
+            print("⚠️ 新闻列表为空，无法计算世界温度")
+            return None
+        
+        # 统计情绪分布
+        pos_count = 0  # 正面（sentiment_score > 0.1）
+        neg_count = 0  # 负面（sentiment_score < -0.1）
+        neu_count = 0  # 中性（-0.1 <= sentiment_score <= 0.1）
+        
+        total_sentiment = 0.0
+        
+        for news_item in news_list:
+            sentiment_score = news_item.get("sentiment_score", 0.0)
+            total_sentiment += sentiment_score
+            
+            if sentiment_score > 0.1:
+                pos_count += 1
+            elif sentiment_score < -0.1:
+                neg_count += 1
+            else:
+                neu_count += 1
+        
+        # 计算世界温度指数 (World Temperature Index)
+        total_count = len(news_list)
+        if total_count == 0:
+            return None
+        
+        # WTI = (正面 - 负面) / 总样本 × 100
+        wti = ((pos_count - neg_count) / total_count) * 100
+        
+        # 计算趋势（对比平均情感分数）
+        avg_sentiment = total_sentiment / total_count if total_count > 0 else 0.0
+        
+        # 判断趋势
+        if avg_sentiment > 0.1:
+            trend = "rising"
+        elif avg_sentiment < -0.1:
+            trend = "falling"
+        else:
+            trend = "stable"
+        
+        result = {
+            "world_temp": round(wti, 2),
+            "trend": trend,
+            "sentiment_distribution": {
+                "pos": pos_count,
+                "neg": neg_count,
+                "neu": neu_count
+            },
+            "total_samples": total_count,
+            "avg_sentiment_score": round(avg_sentiment, 3)
+        }
+        
+        # 【防御】确保 world_temp 不为 None 再格式化
+        world_temp_val = result.get("world_temp")
+        if world_temp_val is None:
+            print("⚙️ [SAFE] 修复空值保护: world_temp_val")
+            world_temp_val = 0.0
+        if world_temp_val is not None:
+            world_temp_val = world_temp_val or 0.0
+            if world_temp_val is None:
+                world_temp_val = 0.0
+            print(f"🌍 世界温度计算完成: WTI = {(world_temp_val or 0.0):.2f}, 趋势 = {trend}")
+            print(f"   情绪分布: 正面 {pos_count}, 负面 {neg_count}, 中性 {neu_count}")
+        else:
+            print(f"⚠️ 世界温度计算完成，但 world_temp 为 None")
+        
+        return result
+        
+    except Exception as e:
+        print(f"❌ 计算世界温度时出错: {type(e).__name__}: {e}")
+        return None
+
+
+def get_world_temperature_summary(world_temp_data: Optional[Dict]) -> str:
+    """
+    生成世界温度的文本摘要
+    
+    Args:
+        world_temp_data: compute_world_temperature() 的返回结果
+    
+    Returns:
+        str: 人类可读的摘要文本
+    """
+    if not WORLD_SENTIMENT_ENABLED:
+        return "世界温度数据暂未启用"
+    if not world_temp_data:
+        return "世界温度数据不可用"
+    
+    wti = world_temp_data.get("world_temp")
+    # 【修复】检查 world_temp 是否为 None
+    if wti is None:
+        print("⚠️ world_temp 数据缺失，使用默认值 0.0")
+        wti = 0.0
+    
+    trend = world_temp_data.get("trend", "stable")
+    dist = world_temp_data.get("sentiment_distribution", {})
+    
+    # 生成趋势描述
+    trend_map = {
+        "rising": "上升",
+        "falling": "下降",
+        "stable": "稳定"
+    }
+    trend_cn = trend_map.get(trend, "稳定")
+    
+    # 生成温度描述
+    if wti > 20:
+        temp_desc = "非常积极"
+    elif wti > 10:
+        temp_desc = "较为积极"
+    elif wti > 0:
+        temp_desc = "略微积极"
+    elif wti > -10:
+        temp_desc = "略微消极"
+    elif wti > -20:
+        temp_desc = "较为消极"
+    else:
+        temp_desc = "非常消极"
+    
+    # 【防御】确保 wti 不为 None
+    wti = wti or 0.0
+    if wti is None:
+        print("⚠️ wti is None, using default 0.0")
+        wti = 0.0
+    summary = (
+        f"全球舆情温度指数 (WTI): {(wti or 0.0):.2f} ({temp_desc})，"
+        f"趋势: {trend_cn}。"
+        f"情绪分布: 正面 {dist.get('pos', 0)} 条，"
+        f"负面 {dist.get('neg', 0)} 条，"
+        f"中性 {dist.get('neu', 0)} 条。"
+    )
+    
+    return summary
+
+
+# 导出函数
+__all__ = [
+    "compute_world_temperature",
+    "get_world_temperature_summary"
+]

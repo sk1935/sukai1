@@ -1,0 +1,47 @@
+{
+  "metadata": {
+    "source": "LMArena.ai leaderboard (2025-10)",
+    "description": "基础权重基于 LMArena 最新模型综合得分，按比例归一化。",
+    "updated_at": "2025-11-02"
+  },
+  "weights": {
+    "gemini-2.5-pro": {
+      "base_weight": 1.00,
+      "score": 1451,
+      "notes": "最高得分模型，用作基准。"
+    },
+    "claude-opus-4-1": {
+      "base_weight": 0.99,
+      "score": 1447,
+      "notes": "高逻辑性与分析能力，适合风险判断。"
+    },
+    "gpt-4o-latest": {
+      "base_weight": 0.99,
+      "score": 1440,
+      "notes": "通用推理和多语言表现出色。"
+    },
+    "grok-4-fast": {
+      "base_weight": 0.98,
+      "score": 1420,
+      "notes": "擅长捕捉市场舆情、另类信号。"
+    },
+    "deepseek-v3.2-exp": {
+      "base_weight": 0.98,
+      "score": 1419,
+      "notes": "自有 API 模型，具备推理和趋势分析能力。"
+    }
+  },
+  "fusion": {
+    "normalization": true,
+    "auto_update": false,
+    "default_confidence_multiplier": {
+      "low": 1.0,
+      "medium": 2.0,
+      "high": 3.0
+    },
+    "notes": "最终融合时，实际权重 = base_weight × 置信度倍数；再进行归一化。"
+  }
+}
+
+
+

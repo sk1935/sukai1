@@ -1,0 +1,285 @@
+"""
+新闻缓存模块
+
+功能：
+- 异步抓取多个新闻源并缓存结果
+- 支持 Google News RSS、GDELT、NewsData.io、Mediastack
+- 缓存有效期：6小时
+- API失效时使用旧缓存，不阻塞主程序
+"""
+import json
+import asyncio
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from typing import Dict, List, Optional
+import sys
+
+# 添加项目根目录到路径
+project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(project_root))
+
+# 导入新闻抓取模块（services 在 src/services 目录下）
+try:
+    # 尝试从 src/services 导入
+    sys.path.insert(0, str(Path(__file__).parent / "services"))
+    from news_fetcher import (
+        fetch_all_free_news,
+        fetch_google_rss,
+        fetch_gdelt_news,
+        fetch_newsdata
+    )
+except ImportError:
+    try:
+        # 回退：从项目根目录的 services 导入
+        from services.news_fetcher import (
+            fetch_all_free_news,
+            fetch_google_rss,
+            fetch_gdelt_news,
+            fetch_newsdata
+        )
+    except ImportError:
+        # 如果都不可用，使用空函数占位
+        print("⚠️ news_fetcher 模块不可用，新闻抓取功能将被禁用")
+        async def fetch_all_free_news(*args, **kwargs):
+            return []
+        async def fetch_google_rss(*args, **kwargs):
+            return []
+        async def fetch_gdelt_news(*args, **kwargs):
+            return []
+        async def fetch_newsdata(*args, **kwargs):
+            return []
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# 缓存配置
+CACHE_DIR = Path(__file__).parent.parent / "cache"
+CACHE_FILE = CACHE_DIR / "news_cache.json"
+CACHE_DURATION_HOURS = 6
+NEWS_CACHE_ENABLED = False  # Stability mode: disable heavy news fetching
+
+
+def ensure_cache_dir():
+    """确保缓存目录存在"""
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def load_cache() -> Optional[Dict]:
+    """加载缓存数据"""
+    ensure_cache_dir()
+    
+    if not CACHE_FILE.exists():
+        return None
+    
+    try:
+        with open(CACHE_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            
+            # 检查缓存是否过期
+            timestamp_str = data.get("timestamp", "")
+            if timestamp_str:
+                try:
+                    timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+                    now = datetime.now(timezone.utc)
+                    
+                    if (now - timestamp).total_seconds() < CACHE_DURATION_HOURS * 3600:
+                        print(f"✅ 使用缓存的新闻数据（剩余有效期：{int((CACHE_DURATION_HOURS * 3600 - (now - timestamp).total_seconds()) / 3600)} 小时）")
+                        return data
+                    else:
+                        print(f"⚠️ 缓存已过期（{int((now - timestamp).total_seconds() / 3600)} 小时前），需要更新")
+                except Exception as e:
+                    print(f"⚠️ 解析缓存时间戳失败: {e}")
+            
+            return data
+    except Exception as e:
+        print(f"⚠️ 加载缓存失败: {e}")
+        return None
+
+
+def save_cache(news_data: List[Dict]) -> bool:
+    """保存缓存数据"""
+    try:
+        ensure_cache_dir()
+        
+        cache_data = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "news": news_data
+        }
+        
+        with open(CACHE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(cache_data, f, ensure_ascii=False, indent=2)
+        
+        print(f"✅ 新闻缓存已保存: {len(news_data)} 条新闻")
+        return True
+    except Exception as e:
+        print(f"❌ 保存缓存失败: {e}")
+        return False
+
+
+def calculate_sentiment_score(title: str, summary: str = "") -> float:
+    """
+    简单的情感分数计算（基于关键词）
+    
+    Args:
+        title: 新闻标题
+        summary: 新闻摘要（可选）
+    
+    Returns:
+        float: 情感分数，范围 [-1.0, 1.0]，正数表示正面，负数表示负面
+    """
+    text = f"{title} {summary}".lower()
+    
+    # 正面关键词
+    positive_keywords = [
+        "success", "growth", "gains", "rise", "surge", "win", "victory",
+        "breakthrough", "improve", "positive", "optimistic", "recover",
+        "稳定", "增长", "成功", "胜利", "突破", "改善", "乐观", "恢复"
+    ]
+    
+    # 负面关键词
+    negative_keywords = [
+        "crisis", "crash", "fall", "decline", "loss", "war", "conflict",
+        "attack", "death", "disaster", "pandemic", "recession", "unemployment",
+        "危机", "崩溃", "下降", "损失", "战争", "冲突", "袭击", "死亡",
+        "灾难", "疫情", "衰退", "失业"
+    ]
+    
+    pos_count = sum(1 for kw in positive_keywords if kw in text)
+    neg_count = sum(1 for kw in negative_keywords if kw in text)
+    
+    total = pos_count + neg_count
+    if total == 0:
+        return 0.0  # 中性
+    
+    # 计算分数：(-1.0 到 1.0)
+    score = (pos_count - neg_count) / max(total, 1)
+    
+    # 归一化到 [-1.0, 1.0]
+    return max(-1.0, min(1.0, score))
+
+
+async def fetch_and_cache_news(keyword: str = "", force_refresh: bool = False) -> List[Dict]:
+    """
+    异步抓取新闻并缓存结果
+    
+    Args:
+        keyword: 搜索关键词（可选）
+        force_refresh: 是否强制刷新（忽略缓存）
+    
+    Returns:
+        List[Dict]: 新闻列表，格式：
+        [
+            {
+                "title": str,
+                "source": str,
+                "summary": str,
+                "sentiment_score": float,
+                "date": str
+            },
+            ...
+        ]
+    """
+    if not NEWS_CACHE_ENABLED:
+        print("🛑 [NEWS_CACHE] 模块已处于禁用状态，直接返回空结果")
+        return []
+    
+    # 检查缓存
+    if not force_refresh:
+        cached_data = load_cache()
+        if cached_data and cached_data.get("news"):
+            return cached_data["news"]
+    
+    print(f"📰 开始抓取新闻（关键词: '{keyword or '通用'}'）...")
+    
+    news_list = []
+    
+    try:
+        # 使用聚合函数抓取所有新闻源
+        all_news = await fetch_all_free_news(keyword=keyword, limit=50)
+        
+        # 转换格式并计算情感分数
+        for item in all_news:
+            try:
+                # 提取日期
+                date_str = ""
+                if item.get("published"):
+                    if isinstance(item["published"], datetime):
+                        date_str = item["published"].strftime("%Y-%m-%d")
+                    elif isinstance(item["published"], str):
+                        try:
+                            date_obj = datetime.fromisoformat(item["published"].replace('Z', '+00:00'))
+                            date_str = date_obj.strftime("%Y-%m-%d")
+                        except:
+                            date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                
+                if not date_str:
+                    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                
+                # 计算情感分数
+                sentiment_score = calculate_sentiment_score(
+                    item.get("title", ""),
+                    item.get("summary", "")
+                )
+                
+                news_item = {
+                    "title": item.get("title", ""),
+                    "source": item.get("source", "Unknown"),
+                    "summary": item.get("summary", "")[:300],  # 限制摘要长度
+                    "sentiment_score": round(sentiment_score, 3),
+                    "date": date_str
+                }
+                
+                if news_item["title"]:  # 只添加有效新闻
+                    news_list.append(news_item)
+            except Exception as e:
+                print(f"⚠️ 处理新闻项时出错: {e}")
+                continue
+        
+        # 保存缓存
+        if news_list:
+            save_cache(news_list)
+            print(f"✅ 成功抓取并缓存 {len(news_list)} 条新闻")
+        else:
+            # 如果没有新数据，尝试使用旧缓存
+            cached_data = load_cache()
+            if cached_data and cached_data.get("news"):
+                print(f"⚠️ 本次抓取未获取到新闻，使用旧缓存（{len(cached_data['news'])} 条）")
+                return cached_data["news"]
+            print(f"⚠️ 未获取到新闻且无缓存可用")
+            
+    except Exception as e:
+        print(f"⚠️ 抓取新闻时出错: {e}")
+        # 出错时尝试使用旧缓存
+        cached_data = load_cache()
+        if cached_data and cached_data.get("news"):
+            print(f"⚠️ API失效或额度用尽，使用旧缓存（{len(cached_data['news'])} 条）")
+            return cached_data["news"]
+    
+    return news_list
+
+
+async def get_cached_news() -> List[Dict]:
+    """
+    获取缓存的新闻（不刷新）
+    
+    Returns:
+        List[Dict]: 缓存的新闻列表
+    """
+    if not NEWS_CACHE_ENABLED:
+        print("🛑 [NEWS_CACHE] 缓存访问已禁用，返回空结果")
+        return []
+    cached_data = load_cache()
+    if cached_data and cached_data.get("news"):
+        return cached_data["news"]
+    return []
+
+
+# 导出函数
+__all__ = [
+    "fetch_and_cache_news",
+    "get_cached_news",
+    "load_cache",
+    "save_cache",
+    "calculate_sentiment_score",
+    "CACHE_FILE"
+]

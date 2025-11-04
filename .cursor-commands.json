@@ -1,0 +1,61 @@
+{
+  "commands": [
+    {
+      "name": "/start",
+      "description": "读取项目结构，进入分析模式",
+      "prompt": "请从当前项目根目录开始，分析整个系统结构：\n1️⃣ 阅读 OPTIMIZATION_NOTES.md，总结系统的五层架构设计。\n2️⃣ 识别 src 目录下的所有主要模块文件（event_manager.py, prompt_builder.py, model_orchestrator.py, fusion_engine.py, output_formatter.py, main.py）。\n3️⃣ 说明每个模块的功能、输入输出和相互关系。\n4️⃣ 不要修改任何代码，只输出对系统架构的理解和依赖关系图。\n5️⃣ 输出格式请包含：\n   - 系统层级说明\n   - 文件功能概述\n   - 数据流路径（从事件输入到最终输出）\n   - 当前缺失或潜在冲突点（如果有）。"
+    },
+    {
+      "name": "/reset",
+      "description": "重置 Cursor 理解上下文（重新开始分析）",
+      "prompt": "请清除当前的上下文记忆和推理状态，回到初始理解模式。接下来请重新执行 /start 分析整个系统结构。不要修改任何文件。"
+    },
+    {
+      "name": "/analyze",
+      "description": "分析逻辑，不改代码",
+      "prompt": "请分析当前文件的逻辑结构，列出主要函数、输入输出、依赖关系和调用顺序。暂时不要修改任何代码。"
+    },
+    {
+      "name": "/findbug",
+      "description": "找出问题点但不修改",
+      "prompt": "请分析输出或运行结果错误的原因，说明是哪个部分的逻辑导致问题。不要修改代码，只做解释。"
+    },
+    {
+      "name": "/fixbug",
+      "description": "执行安全修复（小范围修改）",
+      "prompt": "请修复你刚才分析到的错误，只修改受影响的部分，保持整体逻辑不变，不要重写整个文件。"
+    },
+    {
+      "name": "/crash",
+      "description": "分析报错（Traceback）",
+      "prompt": "这是程序的报错信息。请分析错误来源、涉及文件和行号，解释错误原因。暂时不要修改代码。"
+    },
+    {
+      "name": "/refactor",
+      "description": "重建逻辑（当多次修复后混乱）",
+      "prompt": "当前文件逻辑多次修改后可能混乱，请根据 OPTIMIZATION_NOTES.md 的架构重新梳理结构。保留可用部分，重建一个干净版本。"
+    },
+    {
+      "name": "/output",
+      "description": "输出结果不对",
+      "prompt": "当前输出结果与预期不一致，请解释输出是如何生成的，指出哪个函数负责格式化结果，并找出错误来源。暂时不要修改。"
+    },
+    {
+      "name": "/translate",
+      "description": "输出不是中文",
+      "prompt": "当前输出未使用中文，请确保 output_formatter 在生成最终报告时使用中文模板，并翻译所有 reasoning_summary。"
+    },
+    {
+      "name": "/align",
+      "description": "字段不匹配（跨文件）",
+      "prompt": "fusion_engine.py 与 output_formatter.py 之间的数据字段似乎不一致，请对齐两边字段名和类型，保持语义一致。不要修改其他逻辑。"
+    },
+    {
+      "name": "/test",
+      "description": "让 Cursor 提示测试方法",
+      "prompt": "请说明如何测试当前函数或模块，列出需要检查的关键点和可能的边界情况。不要修改代码。"
+    }
+  ]
+}
+
+

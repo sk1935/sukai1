@@ -1,0 +1,1198 @@
+"""
+融合层（Fusion Engine）：
+根据 OPTIMIZATION_NOTES.md 的五层架构设计
+
+职责：
+- 对不同模型的预测进行加权融合
+- 计算 AI 共识概率与市场概率的融合结果（80% AI + 20% 市场）
+- 生成简短的"AI共识观点总结"（中文）
+- 评估模型间的分歧程度
+- 从 LMArena.ai 基础权重配置文件加载模型权重
+
+输入：各模型的预测结果 {probability, confidence, reasoning}
+输出：融合后的预测 {final_prob, model_only_prob, uncertainty, summary, disagreement}
+"""
+import json
+import math
+import time
+import re
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+from datetime import datetime, timezone
+
+
+class FusionEngine:
+    """
+    Fuses multiple model predictions with weighted averaging.
+    
+    融合多个模型的预测结果：
+    - 使用模型权重和置信度权重计算加权平均
+    - 将AI共识（80%）与市场概率（20%）融合
+    - 生成中文摘要
+    - 评估分歧程度
+    - 从 LMArena.ai 配置文件加载基础权重
+    """
+    
+    CONFIDENCE_WEIGHTS = {
+        "low": 1.0,
+        "medium": 2.0,
+        "high": 3.0
+    }
+    
+    MARKET_WEIGHT = 0.2  # Weight for market probability (降低市场权重)
+    MODEL_WEIGHT = 0.8   # Weight for model consensus (提高模型权重)
+    
+    # Model name mapping: actual model_id -> LMArena config key
+    MODEL_NAME_MAPPING = {
+        "gpt-4o": "gpt-4o-latest",
+        "claude-3-7-sonnet-latest": "claude-opus-4-1",  # Map to closest match
+        "claude-3-5-opus-latest": "claude-opus-4-1",
+        "gemini-2.5-pro": "gemini-2.5-pro",
+        "gemini-2.5-flash": "gemini-2.5-pro",  # Fallback to pro if flash not found
+        "grok-4": "grok-4-fast",
+        "grok-3": "grok-4-fast",  # Fallback
+        "deepseek-chat": "deepseek-v3.2-exp"
+    }
+    
+    def __init__(self, experiment_config=None):
+        """
+        Initialize FusionEngine and load LMArena base weights.
+        
+        Args:
+            experiment_config: Optional ExperimentConfig instance for ablation studies
+        """
+        self.lmarena_config = self._load_lmarena_config()
+        self.base_weights = self.lmarena_config.get("weights", {})
+        self.metadata = self.lmarena_config.get("metadata", {})
+        self.fusion_config = self.lmarena_config.get("fusion", {})
+        
+        # Experiment configuration (for ablation studies)
+        self.experiment_config = experiment_config
+        
+        # Update confidence weights from config if available
+        if "default_confidence_multiplier" in self.fusion_config:
+            self.CONFIDENCE_WEIGHTS.update(self.fusion_config["default_confidence_multiplier"])
+        
+        # Log weights on initialization
+        self._log_base_weights()
+        
+        # Calibration state (for binning/platt calibration)
+        self.calibration_map = None  # Will be fitted during calibration
+    
+    def _load_lmarena_config(self) -> Dict:
+        """Load base weights from LMArena configuration file."""
+        config_path = Path(__file__).parent.parent / "config" / "base_weights_lmarena.json"
+        
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+            return config
+        except FileNotFoundError:
+            print(f"⚠️ LMArena权重配置文件未找到: {config_path}")
+            print("   使用默认权重配置...")
+            return {
+                "metadata": {"source": "默认配置", "updated_at": "未知"},
+                "weights": {},
+                "fusion": {}
+            }
+        except json.JSONDecodeError as e:
+            print(f"⚠️ LMArena权重配置文件解析错误: {e}")
+            print("   使用默认权重配置...")
+            return {
+                "metadata": {"source": "默认配置", "updated_at": "未知"},
+                "weights": {},
+                "fusion": {}
+            }
+    
+    def _log_base_weights(self):
+        """Log base weights information on startup."""
+        source = self.metadata.get("source", "未知来源")
+        updated_at = self.metadata.get("updated_at", "未知")
+        
+        print(f"📊 模型基础权重来源：{source}")
+        
+        # Collect weight info for active models
+        weight_info = []
+        for model_key, config in self.base_weights.items():
+            base_weight = config.get("base_weight", 1.0) or 0.0
+            # 【防御】确保 base_weight 不为 None
+            if base_weight is None:
+                print(f"⚠️ base_weight is None for {model_key}, using default 0.0")
+                base_weight = 0.0
+            # Find display name (simplified)
+            if "gemini" in model_key:
+                weight_info.append(f"Gemini {(base_weight or 0.0):.2f}")
+            elif "claude" in model_key:
+                weight_info.append(f"Claude {(base_weight or 0.0):.2f}")
+            elif "gpt" in model_key:
+                weight_info.append(f"GPT-4o {(base_weight or 0.0):.2f}")
+            elif "grok" in model_key:
+                weight_info.append(f"Grok {(base_weight or 0.0):.2f}")
+            elif "deepseek" in model_key:
+                weight_info.append(f"DeepSeek {(base_weight or 0.0):.2f}")
+        
+        if weight_info:
+            print(" / ".join(weight_info))
+        else:
+            print("未加载到权重配置")
+    
+    def _get_base_weight(self, model_name: str) -> float:
+        """
+        Get base weight for a model from LMArena config.
+        
+        Args:
+            model_name: Actual model ID used in the system
+            
+        Returns:
+            Base weight from LMArena config, or 1.0 if not found
+        """
+        # Map model name to LMArena config key
+        lmarena_key = self.MODEL_NAME_MAPPING.get(model_name, model_name)
+        
+        # Try exact match first
+        if lmarena_key in self.base_weights:
+            return self.base_weights[lmarena_key].get("base_weight", 1.0)
+        
+        # Try partial match (e.g., "claude-3-7-sonnet" might match "claude-opus-4-1")
+        for key, config in self.base_weights.items():
+            if model_name in key or key in model_name:
+                return config.get("base_weight", 1.0)
+        
+        # Fallback: return 1.0
+        return 1.0
+    
+    def fuse_predictions(
+        self,
+        model_results: Dict[str, Optional[Dict]],
+        model_weights: Dict[str, float],
+        market_prob: float,
+        orchestrator=None  # Optional: pass orchestrator instance to avoid creating new one
+    ) -> Dict:
+        """
+        Fuse predictions from multiple models.
+        
+        Args:
+            model_results: Dict mapping model_name -> {probability, confidence, reasoning}
+            model_weights: Dict mapping model_name -> weight
+            market_prob: Market probability from Polymarket
+        
+        Returns:
+            Dict with final_prob, uncertainty, summary, disagreement
+        """
+        start_time = time.time()
+        print(f"[DEBUG] ========== fuse_predictions START ==========")
+        print(f"[DEBUG] Model results count: {len(model_results)}")
+        print(f"[DEBUG] Market prob: {market_prob}")
+        # Filter out None results
+        valid_results = {
+            name: result
+            for name, result in model_results.items()
+            if result is not None
+        }
+        
+        if not valid_results:
+            # Fallback if no models responded
+            return {
+                "final_prob": market_prob,
+                "model_only_prob": None,  # No model prediction available
+                "uncertainty": 10.0,
+                "summary": "没有可用的模型响应。使用市场概率。",
+                "disagreement": "高",
+                "model_count": 0
+            }
+        
+        # Calculate weighted probabilities
+        probabilities: List[float] = []
+        weights: List[float] = []
+        reasonings = []
+        deepseek_reasoning = None  # Store DeepSeek's reasoning separately
+        
+        for model_name, result in valid_results.items():
+            prob = self._safe_float(result.get("probability"))
+            confidence = result["confidence"]
+            reasoning = result["reasoning"]
+            
+            # Use LMArena base weight instead of model_weights parameter
+            base_weight = self._get_base_weight(model_name)
+            confidence_weight = self.CONFIDENCE_WEIGHTS.get(confidence, 2.0)
+            total_weight = self._safe_float(base_weight, 0.0) * self._safe_float(confidence_weight, 0.0)
+            
+            probabilities.append(prob)
+            weights.append(total_weight)
+            # Only add reasoning, not model name
+            reasonings.append(reasoning)
+            
+            # Extract DeepSeek reasoning separately
+            if model_name == "deepseek-chat":
+                deepseek_reasoning = reasoning
+        
+        # Weighted mean / variance without numpy (防止 numpy 导入导致崩溃)
+        weighted_mean = self._weighted_mean(probabilities, weights)
+        uncertainty = self._weighted_std(probabilities, weights, weighted_mean)
+        
+        # Apply consensus coefficient if enabled
+        if self._should_use_consensus_coef():
+            consensus_weight = weighted_mean
+        else:
+            # If consensus_coef is disabled, use simple average
+            consensus_weight = self._mean(probabilities)
+        
+        # Combine with market probability (if market_bias enabled)
+        if self._should_use_market_bias():
+            final_prob = (
+                self.MODEL_WEIGHT * consensus_weight +
+                self.MARKET_WEIGHT * market_prob
+            )
+        else:
+            # If market_bias is disabled, use pure AI consensus
+            final_prob = consensus_weight
+        
+        # Apply de-marketization penalty (if enabled)
+        demarket_applied = False
+        if self._should_use_demarket_penalty():
+            penalty_result = self._apply_demarket_penalty(
+                final_prob, consensus_weight, market_prob, valid_results
+            )
+            if penalty_result:
+                final_prob = penalty_result["adjusted_prob"]
+                demarket_applied = True
+        
+        # Apply post-calibration if enabled
+        calibration_applied = False
+        calibration_method = self._get_calibration_method()
+        if calibration_method and calibration_method != "none":
+            calibrated_prob = self._apply_calibration(final_prob, calibration_method)
+            if calibrated_prob is not None:
+                final_prob = calibrated_prob
+                calibration_applied = True
+        
+        # Calculate disagreement level
+        disagreement = self._calculate_disagreement(probabilities, uncertainty)
+        
+        # Generate summary
+        summary = self._generate_summary(reasonings, consensus_weight, market_prob)
+        
+        # Add weight source information
+        weight_source = {
+            "file": "base_weights_lmarena.json",
+            "source": self.metadata.get("source", "未知"),
+            "updated_at": self.metadata.get("updated_at", "未知")
+        }
+        
+        result = {
+            "final_prob": round(final_prob, 2),
+            "model_only_prob": round(consensus_weight, 2),  # Pure model prediction before market fusion
+            "uncertainty": round(uncertainty, 2),
+            "summary": summary,
+            "disagreement": disagreement,
+            "model_count": len(valid_results),
+            "deepseek_reasoning": deepseek_reasoning,  # DeepSeek's reasoning for separate display
+            "model_versions": self._get_model_versions(valid_results, orchestrator),  # Add model versions info
+            "weight_source": weight_source  # Add weight source info
+        }
+        
+        # Add experiment flags if applicable
+        if demarket_applied:
+            result["demarket_applied"] = True
+            result["demarket_note"] = "Applied de-marketization penalty to avoid pure tracking."
+        if calibration_applied:
+            result["calibration_applied"] = True
+            result["calibration_method"] = calibration_method
+        
+        total_time = time.time() - start_time
+        # 【防御】确保 total_time 不为 None
+        total_time = total_time or 0.0
+        if total_time is None:
+            print("⚠️ total_time is None, using default 0.0")
+            total_time = 0.0
+        print(f"[DEBUG] Total model fusion time: {(total_time or 0.0):.2f}s")
+        print(f"[DEBUG] ========== fuse_predictions END ==========")
+        
+        return result
+    
+    def _get_model_versions(self, model_results: Dict[str, Optional[Dict]], orchestrator=None) -> Dict[str, Dict]:
+        """Get model version information from ModelOrchestrator."""
+        try:
+            # Use provided orchestrator if available, otherwise create a new one
+            if orchestrator is None:
+                from src.model_orchestrator import ModelOrchestrator
+                orchestrator = ModelOrchestrator()
+            
+            versions = {}
+            for model_name in model_results.keys():
+                if model_results[model_name] is not None:  # Only for successful calls
+                    info = orchestrator.get_model_info(model_name)
+                    if info:
+                        versions[model_name] = {
+                            "display_name": info["display_name"],
+                            "last_updated": info.get("last_updated", "未知")
+                        }
+            
+            return versions
+        except Exception as e:
+            print(f"⚠️ 获取模型版本信息失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return {}
+    
+    def _calculate_disagreement(self, probabilities: List[float], uncertainty: float) -> str:
+        """Calculate disagreement level based on uncertainty."""
+        # Handle edge case: single model or zero uncertainty
+        if len(probabilities) <= 1 or uncertainty == 0.0:
+            return "低"
+        elif uncertainty < 3.0:
+            return "低"
+        elif uncertainty < 8.0:
+            return "中"
+        else:
+            return "高"
+    
+    def _generate_summary(self, reasonings: List[str], model_prob: float, market_prob: float) -> str:
+        """
+        Generate a brief summary from model reasonings.
+        优化：确保生成的摘要更简洁，突出关键观点，且为中文。
+        """
+        if not reasonings:
+            return "暂无详细推理信息。"
+        
+        # Combine first few reasonings (already cleaned, no model names)
+        # 优先使用前2个模型的推理，如果都是中文则直接合并
+        summary_parts = reasonings[:2]  # Use first 2 models' reasoning
+        
+        # 检查是否包含中文字符
+        has_chinese = any(any('\u4e00' <= char <= '\u9fff' for char in part) for part in summary_parts)
+        
+        if has_chinese:
+            # 如果包含中文，直接合并
+            summary = " ".join(summary_parts)
+        else:
+            # 如果都是英文，添加提示说明这是英文推理
+            # 实际使用中，由于prompt要求中文，这里应该不会触发
+            summary = "模型推理：" + " ".join(summary_parts)
+        
+        # Truncate if too long (保持简洁)
+        if len(summary) > 200:
+            summary = summary[:197] + "..."
+        
+        return summary
+    
+    @staticmethod
+    def classify_multi_option_event(event_title: str, outcomes: List[Dict]) -> str:
+        """
+        根据事件标题和选项内容自动识别事件类型。
+        
+        Args:
+            event_title: 事件标题
+            outcomes: 选项列表，每个包含 name 字段
+        
+        Returns:
+            "mutually_exclusive" - 互斥事件（候选人、政党、球队等）
+            "conditional" - 条件事件（时间、价格、地理分组等）
+            "hybrid" - 混合事件（无法确定）
+        """
+        if not outcomes or len(outcomes) == 0:
+            return "hybrid"
+        
+        event_title_lower = event_title.lower() if event_title else ""
+        
+        # 【修复 #4】日期模式识别（正则表达式）
+        date_patterns = [
+            r'\bon\s+\w+\s+\d+',  # "on Oct 30", "on November 15"
+            r'\bby\s+\w+\s+\d+',  # "by Dec 31", "by December 31"
+            r'\bbefore\s+\w+\s+\d+',  # "before Jan 1"
+            r'\bafter\s+\w+\s+\d+',  # "after Nov 30"
+            r'\buntil\s+\w+\s+\d+',  # "until Dec 31"
+            r'\bdeadline\s+\w+\s+\d+',  # "deadline Oct 30"
+        ]
+        
+        # 【修复 #4】检查事件标题中的日期模式
+        has_date_pattern = any(re.search(pattern, event_title_lower, re.IGNORECASE) for pattern in date_patterns)
+        if has_date_pattern:
+            print(f"[DEBUG] 检测到日期模式，直接判定为 conditional")
+            return "conditional"
+        
+        # 【修复 #4】价格模式识别
+        price_patterns = [
+            r'price\s+(above|below|over|under|at least|at most)\s+',
+            r'\$\d+',  # "$100k", "$1M"
+            r'\d+\s*(million|billion|trillion|k|m|b)\s*(usd|eur|€|¥)?',
+        ]
+        has_price_pattern = any(re.search(pattern, event_title_lower, re.IGNORECASE) for pattern in price_patterns)
+        if has_price_pattern:
+            print(f"[DEBUG] 检测到价格模式，直接判定为 conditional")
+            return "conditional"
+        
+        # 条件事件特征关键词
+        conditional_keywords = {
+            # 【修复 #2】时间相关 - 添加月份全写和星期
+            "time": [
+                # 月份缩写
+                "oct", "nov", "dec", "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep",
+                # 【修复 #2】月份全写
+                "october", "november", "december", "january", "february", "march", "april",
+                "june", "july", "august", "september",
+                # 【修复 #2】星期
+                "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+                "mon", "tue", "wed", "thu", "fri", "sat", "sun",
+                # 年份
+                "2024", "2025", "2026", "2027", "2028", "2029", "2030",
+                # 其他时间相关
+                "day", "month", "year", "q1", "q2", "q3", "q4", "h1", "h2",
+                "before", "after", "by", "until", "deadline",
+                # 【修复 #2】日期格式模式
+                r'\d{1,2}[/-]\d{1,2}',  # "10/30", "10-30"
+                r'\d{1,2}[/-]\d{1,2}[/-]\d{4}',  # "10/30/2025"
+            ],
+            # 价格/数值相关
+            "price": ["$", "€", "¥", "usd", "eur", "million", "billion", "trillion",
+                     "k", "m", "b", "%", "percent", "bps", "basis points",
+                     "above", "below", "more than", "less than", "at least", "at most",
+                     "range", "between", "over", "under"],
+            # 【修复 #1】地理/指标相关 - 添加具体国家名和城市名
+            "geographic": [
+                # 通用地理词汇
+                "region", "country", "state", "city", "province", "area",
+                # 【修复 #1】常见国家名
+                "israel", "lebanon", "palestine", "syria", "iran", "iraq", "saudi arabia",
+                "russia", "ukraine", "china", "taiwan", "north korea", "south korea",
+                "japan", "india", "pakistan", "afghanistan", "turkey", "egypt",
+                "us", "usa", "united states", "uk", "united kingdom", "france", "germany",
+                "italy", "spain", "poland", "greece", "brazil", "mexico", "canada",
+                "australia", "new zealand", "south africa", "nigeria", "kenya",
+                # 【修复 #1】常见城市名
+                "beijing", "shanghai", "moscow", "london", "paris", "berlin", "tokyo",
+                "tel aviv", "beirut", "damascus", "baghdad", "tehran", "riyadh",
+                "new york", "washington", "los angeles", "chicago", "san francisco",
+                "kiev", "kyiv", "istanbul", "cairo", "jerusalem", "gaza",
+            ],
+            # 指标相关
+            "indicator": ["gdp", "inflation", "unemployment", "rate", "ratio", "index",
+                         "temperature", "rainfall", "pollution", "score"]
+        }
+        
+        conditional_score = 0
+        mutually_exclusive_score = 0
+        
+        # 检查事件标题
+        for category, keywords in conditional_keywords.items():
+            for kw in keywords:
+                if isinstance(kw, str) and kw in event_title_lower:
+                    conditional_score += 2
+                elif isinstance(kw, str) and kw.startswith('\\'):  # 正则表达式模式
+                    if re.search(kw, event_title_lower):
+                        conditional_score += 2
+        
+        # 检查选项内容
+        for outcome in outcomes:
+            name = outcome.get('name', '').strip()
+            if not name:
+                continue
+            
+            name_lower = name.lower()
+            
+            # 【修复 #5】先检查是否为日期格式，避免被误判为互斥型
+            is_date_format = False
+            # 检查月份名称
+            month_names = ["jan", "feb", "mar", "apr", "may", "jun", 
+                          "jul", "aug", "sep", "oct", "nov", "dec",
+                          "january", "february", "march", "april",
+                          "june", "july", "august", "september",
+                          "october", "november", "december"]
+            if any(month in name_lower for month in month_names):
+                is_date_format = True
+            # 检查日期模式：MM/DD, DD/MM, MM-DD 等
+            if re.search(r'\d{1,2}[/-]\d{1,2}', name):
+                is_date_format = True
+            # 检查数字 + 月份格式：30 Oct, Oct 30, November 15 等
+            if re.search(r'\d{1,2}\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|january|february|march|april|june|july|august|september|october|november|december)', name_lower):
+                is_date_format = True
+            if re.search(r'(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|january|february|march|april|june|july|august|september|october|november|december)\s+\d{1,2}', name_lower):
+                is_date_format = True
+            
+            # 检查条件型特征
+            has_time = any((kw if isinstance(kw, str) else None) and kw in name_lower 
+                          for kw in conditional_keywords["time"] if isinstance(kw, str) and not kw.startswith('\\'))
+            # 检查正则表达式模式
+            for kw in conditional_keywords["time"]:
+                if isinstance(kw, str) and kw.startswith('\\'):
+                    if re.search(kw, name_lower):
+                        has_time = True
+                        break
+            
+            has_price = any(kw in name_lower for kw in conditional_keywords["price"])
+            has_geo = any(kw in name_lower for kw in conditional_keywords["geographic"])
+            has_indicator = any(kw in name_lower for kw in conditional_keywords["indicator"])
+            has_number = bool(re.search(r'\d', name))
+            has_symbol = bool(re.search(r'[%$€¥<>\-–—]', name))
+            
+            if has_time or has_price or has_geo or has_indicator or (has_number and has_symbol):
+                conditional_score += 2
+            elif has_number and not has_symbol:
+                # 纯数字可能是条件型（日期、价格等）
+                conditional_score += 1
+            
+            # 【修复 #5】检查互斥型特征（人名、组织名等）- 排除日期格式
+            # 人名特征：首字母大写、包含空格、无特殊符号，且不是日期格式
+            if not is_date_format:
+                words = name.split()
+                if len(words) <= 4:
+                    is_capitalized = all(word and word[0].isupper() for word in words if word)
+                    has_no_special = not bool(re.search(r'[%$€¥<>\-–—\d]', name))
+                    # 额外检查：不包含明显的条件型关键词（月份、星期等）
+                    has_no_time_keywords = not any(month in name_lower for month in month_names)
+                    if is_capitalized and has_no_special and has_no_time_keywords:
+                        mutually_exclusive_score += 2  # 增加权重，因为这是强烈的人名特征
+        
+        # 【修复 #6】输出详细调试日志
+        print(f"[DEBUG] 事件类型识别详情:")
+        print(f"  标题: {event_title[:60]}...")
+        print(f"  选项数量: {len(outcomes)}")
+        print(f"  conditional_score: {conditional_score}")
+        print(f"  mutually_exclusive_score: {mutually_exclusive_score}")
+        
+        # 【修复 #3】改进判断阈值 - 使用更智能的逻辑
+        # 策略：如果 mutually_exclusive_score 明显更高，优先判定为 mutually_exclusive
+        # 否则优先判定为 conditional（避免误归一化）
+        
+        # 计算选项中人名比例（用于更准确的判断）
+        total_outcomes = len(outcomes)
+        person_like_count = sum(1 for o in outcomes 
+                               if o.get('name', '').strip() and 
+                               not re.search(r'[%$€¥<>\-–—\d]', o.get('name', '')) and
+                               all(word and word[0].isupper() for word in o.get('name', '').split()[:4]))
+        person_ratio = person_like_count / total_outcomes if total_outcomes > 0 else 0
+        
+        # 如果大部分选项都是人名格式，且 mutually_exclusive_score 足够高，判定为互斥型
+        # 注意：标题中的年份（如 "2024 Election"）不应该影响判断，所以提高 person_ratio 的权重
+        if person_ratio > 0.6:
+            # 如果大部分选项是人名，且 mutually_exclusive_score 不为0，判定为互斥型
+            # 这可以覆盖标题中有年份等条件关键词但实际是选举类事件的情况
+            if mutually_exclusive_score > 0:
+                result = "mutually_exclusive"
+            else:
+                # 如果没有任何互斥特征，可能是其他类型
+                result = "conditional" if conditional_score > 0 else "hybrid"
+        elif person_ratio > 0.4 and mutually_exclusive_score >= conditional_score * 0.7:
+            # 如果 40%+ 是人名格式，且互斥得分足够高，也判定为互斥型
+            result = "mutually_exclusive"
+        elif conditional_score > 0 and conditional_score >= mutually_exclusive_score * 1.5:
+            # conditional_score 明显更高
+            result = "conditional"
+        elif mutually_exclusive_score > 0 and mutually_exclusive_score > conditional_score * 1.5:
+            # mutually_exclusive_score 明显更高
+            result = "mutually_exclusive"
+        elif conditional_score > mutually_exclusive_score:
+            # conditional_score 稍高，判定为 conditional（保守策略，避免误归一化）
+            result = "conditional"
+        elif mutually_exclusive_score > conditional_score:
+            result = "mutually_exclusive"
+        else:
+            # 相等或都为0，判定为 hybrid（不归一化）
+            result = "hybrid"
+        
+        print(f"  判定结果: {result}")
+        return result
+    
+    @staticmethod
+    def filter_invalid_outcomes(outcomes: List[Dict]) -> List[Dict]:
+        """
+        自动跳过已过期或无效的子市场。
+        
+        过滤规则：
+        - 时间型：日期早于当前 UTC 日期
+        - 价格型：条件逻辑无效（如 "above 1000000%"）
+        - 其他无效项：重复或空标题
+        
+        Args:
+            outcomes: 选项列表
+        
+        Returns:
+            过滤后的有效选项列表
+        """
+        if not outcomes:
+            return []
+        
+        valid_outcomes = []
+        seen_names = set()
+        now_utc = datetime.now(timezone.utc)
+        
+        # 日期模式匹配
+        date_patterns = [
+            r'(\d{1,2})[/-](\d{1,2})[/-](\d{4})',  # MM/DD/YYYY or DD/MM/YYYY
+            r'(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\s+(\d{1,2}),?\s+(\d{4})',  # Month DD, YYYY
+            r'(\d{4})[/-](\d{1,2})[/-](\d{1,2})',  # YYYY/MM/DD
+        ]
+        
+        month_map = {
+            'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6,
+            'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12
+        }
+        
+        for outcome in outcomes:
+            name = outcome.get('name', '').strip()
+            
+            # 过滤空标题
+            if not name:
+                continue
+            
+            # 过滤重复项
+            name_normalized = name.lower().strip()
+            if name_normalized in seen_names:
+                print(f"[DEBUG] 跳过重复选项: {name}")
+                continue
+            seen_names.add(name_normalized)
+            
+            # 尝试解析日期（时间型选项）
+            is_expired = False
+            name_lower = name.lower()
+            
+            for pattern in date_patterns:
+                match = re.search(pattern, name_lower, re.IGNORECASE)
+                if match:
+                    try:
+                        if 'jan' in name_lower or 'feb' in name_lower:  # 月份名称格式
+                            month_name = match.group(1).lower()[:3]
+                            day = int(match.group(2))
+                            year = int(match.group(3))
+                            month = month_map.get(month_name)
+                            if month:
+                                option_date = datetime(year, month, day, tzinfo=timezone.utc)
+                                if option_date < now_utc:
+                                    is_expired = True
+                                    print(f"[DEBUG] 跳过过期选项: {name} (日期: {option_date.date()})")
+                        else:  # 数字格式日期
+                            parts = match.groups()
+                            if len(parts) == 3:
+                                # 尝试不同的日期格式
+                                try:
+                                    # MM/DD/YYYY
+                                    month, day, year = int(parts[0]), int(parts[1]), int(parts[2])
+                                    if month <= 12 and day <= 31:
+                                        option_date = datetime(year, month, day, tzinfo=timezone.utc)
+                                        if option_date < now_utc:
+                                            is_expired = True
+                                            print(f"[DEBUG] 跳过过期选项: {name} (日期: {option_date.date()})")
+                                except:
+                                    try:
+                                        # DD/MM/YYYY
+                                        day, month, year = int(parts[0]), int(parts[1]), int(parts[2])
+                                        if month <= 12 and day <= 31:
+                                            option_date = datetime(year, month, day, tzinfo=timezone.utc)
+                                            if option_date < now_utc:
+                                                is_expired = True
+                                                print(f"[DEBUG] 跳过过期选项: {name} (日期: {option_date.date()})")
+                                    except:
+                                        pass
+                    except:
+                        pass
+                    break
+            
+            if is_expired:
+                continue
+            
+            # 过滤无效价格条件（如 "above 1000000%" 这种明显不合理的情况）
+            if '%' in name or '$' in name or 'usd' in name_lower:
+                # 检查是否有极端数值
+                numbers = re.findall(r'[\d,]+\.?\d*', name)
+                for num_str in numbers:
+                    try:
+                        num = float(num_str.replace(',', ''))
+                        # 如果百分比超过 1000% 或价格超过合理范围，可能是无效选项
+                        if '%' in name and num > 1000:
+                            print(f"[DEBUG] 跳过无效价格选项: {name} (数值异常: {num}%)")
+                            is_expired = True
+                            break
+                    except:
+                        pass
+            
+            if is_expired:
+                continue
+            
+            # 所有检查通过，添加有效选项
+            valid_outcomes.append(outcome)
+        
+        if len(outcomes) != len(valid_outcomes):
+            print(f"[DEBUG] 过滤无效选项: {len(outcomes)} → {len(valid_outcomes)}")
+        
+        return valid_outcomes
+    
+    @staticmethod
+    def normalize_all_predictions(outcomes: List[Dict], event_title: str = "") -> Dict:
+        """
+        对所有 outcome 的 AI 预测概率进行归一化，使其总和等于 100%。
+        
+        功能：
+        1. 根据事件类型判断是否需要归一化（互斥事件归一化，条件事件不归一化）
+        2. 过滤无效/过期选项
+        3. 提取所有有效的 AI 预测（model_only_prob）
+        4. 若 Σ(AI_probs) ≠ 100，按比例缩放（仅互斥事件）
+        5. 同时归一化不确定度（uncertainty），保持相对比例
+        6. 处理异常值（>100 或 <0）自动裁剪至 [0,100]
+        7. 容错处理：跳过 None 值，处理全为 0 的情况
+        
+        Args:
+            outcomes: List of dicts, each containing:
+                - "prediction": float (融合后的概率，可能包含市场权重)
+                - "market_prob": float (市场价格)
+                - "uncertainty": float (不确定度)
+                - "model_only_prob": Optional[float] (纯AI预测，如果存在)
+                - 其他字段...
+            event_title: 事件标题，用于判断事件类型
+        
+        Returns:
+            Dict with:
+                - "normalized_outcomes": List[Dict] (归一化后的 outcomes，添加了 normalized 字段)
+                - "total_before": float (归一化前的总和)
+                - "total_after": float (归一化后的总和，互斥事件=100.0，条件事件保持原值)
+                - "error": float (误差，应该≤0.01)
+                - "skipped_count": int (跳过的无效选项数量)
+                - "normalized": bool (是否执行了归一化)
+                - "event_type": str (事件类型：mutually_exclusive / conditional / hybrid)
+        """
+        if not outcomes or len(outcomes) == 0:
+            return {
+                "normalized_outcomes": [],
+                "total_before": 0.0,
+                "total_after": 0.0,
+                "error": 0.0,
+                "skipped_count": 0,
+                "normalized": False,
+                "event_type": "hybrid"
+            }
+        
+        # 【新增】过滤无效/过期选项
+        filtered_outcomes = FusionEngine.filter_invalid_outcomes(outcomes)
+        if len(filtered_outcomes) != len(outcomes):
+            print(f"[DEBUG] 过滤后选项数量: {len(outcomes)} → {len(filtered_outcomes)}")
+        
+        # 【新增】识别事件类型
+        if not event_title:
+            print(f"[WARNING] event_title 为空，可能影响事件类型识别")
+        event_type = FusionEngine.classify_multi_option_event(event_title or "", filtered_outcomes)
+        print(f"[DEBUG] 最终事件类型: {event_type} (事件: {(event_title or '')[:50]}...)")
+        
+        # 【关键改进】根据事件类型决定是否归一化
+        should_normalize = (event_type == "mutually_exclusive")
+        
+        if not should_normalize:
+            # 条件事件或混合事件：不归一化，只添加 normalized 标记
+            if event_type == "conditional":
+                print(f"[FusionEngine] 条件事件检测到，跳过归一化。")
+            
+            marked_outcomes = []
+            for outcome in filtered_outcomes:
+                marked_outcome = outcome.copy()
+                marked_outcome["normalized"] = False
+                marked_outcomes.append(marked_outcome)
+            
+            # 计算总和（仅用于调试，不返回给输出层）
+            total_before = sum(
+                outcome.get("model_only_prob") or 0
+                for outcome in filtered_outcomes
+                if outcome.get("model_only_prob") is not None
+            )
+            
+            return {
+                "normalized_outcomes": marked_outcomes,
+                "total_before": round(total_before, 2),
+                "total_after": None,  # 【修复】条件事件不返回 total_after，表示不应显示归一化检查
+                "error": 0.0,
+                "skipped_count": len(outcomes) - len(filtered_outcomes),
+                "normalized": False,
+                "event_type": event_type
+            }
+        
+        # 互斥事件：执行归一化（原有逻辑）
+        outcomes = filtered_outcomes  # 使用过滤后的选项
+        
+        # 提取所有有效的 AI 预测值（优先使用 model_only_prob，如果没有则尝试从 prediction 推算）
+        valid_outcomes = []
+        ai_probs = []
+        uncertainties = []
+        skipped_indices = []
+        
+        for i, outcome in enumerate(outcomes):
+            # 优先使用 model_only_prob（纯AI预测）
+            # 注意：如果 model_only_prob 为 None，说明该选项没有有效的AI预测，应该跳过归一化
+            ai_prob = outcome.get("model_only_prob")
+            
+            # 如果 model_only_prob 为 None，跳过该选项（不进行归一化）
+            if ai_prob is None:
+                skipped_indices.append(i)
+                continue
+            
+            # 裁剪异常值到 [0, 100]
+            ai_prob = max(0.0, min(100.0, float(ai_prob)))
+            
+            uncertainty = outcome.get("uncertainty", 0.0)
+            if uncertainty is None:
+                uncertainty = 0.0
+            
+            valid_outcomes.append(outcome)
+            ai_probs.append(ai_prob)
+            uncertainties.append(float(uncertainty))
+        
+        # 检查是否有有效数据
+        if len(valid_outcomes) == 0:
+            # 所有选项都无效，返回原数据
+            return {
+                "normalized_outcomes": outcomes,
+                "total_before": 0.0,
+                "total_after": 0.0,
+                "error": 0.0,
+                "skipped_count": len(outcomes)
+            }
+        
+        # 计算总和
+        total_before = sum(ai_probs)
+        
+        # 【关键改进】互斥事件：归一化处理
+        if total_before == 0:
+            # 全为 0 的情况：均分（避免除零）
+            normalized_probs = [100.0 / len(ai_probs)] * len(ai_probs)
+            # 不确定度保持原值（已经是相对值）
+            normalized_uncertainties = uncertainties
+            total_after = 100.0
+        else:
+            # 按比例缩放
+            scale_factor = 100.0 / total_before
+            normalized_probs = [prob * scale_factor for prob in ai_probs]
+            
+            # 归一化不确定度：保持相对比例，但需要相应缩放
+            # 由于概率被缩放，不确定度也应该按相同比例缩放（保持相对关系）
+            normalized_uncertainties = [unc * scale_factor for unc in uncertainties]
+            
+            # 验证总和
+            total_after = sum(normalized_probs)
+        
+        # 计算误差
+        error = abs(total_after - 100.0)
+        
+        # 更新 outcomes
+        normalized_outcomes = []
+        valid_idx = 0
+        
+        # 【Bug修复】添加验证，确保 valid_idx 不会越界
+        if len(normalized_probs) != len(ai_probs):
+            print(f"⚠️ [WARNING] 归一化数组长度不匹配：normalized_probs={len(normalized_probs)}, ai_probs={len(ai_probs)}")
+        
+        for i, outcome in enumerate(outcomes):
+            if i in skipped_indices:
+                # 跳过的选项，保持原样（确保 model_only_prob 保持为 None）
+                skipped_outcome = outcome.copy()
+                # 【Bug修复】明确确保跳过的选项的 model_only_prob 为 None
+                if skipped_outcome.get("model_only_prob") is not None:
+                    print(f"[DEBUG] 跳过选项 {outcome.get('name', i)}，但 model_only_prob 不为 None，强制设为 None")
+                skipped_outcome["model_only_prob"] = None
+                normalized_outcomes.append(skipped_outcome)
+            else:
+                # 更新 AI 预测概率（需要同时更新 prediction，因为它是融合后的值）
+                if valid_idx >= len(normalized_probs):
+                    print(f"⚠️ [ERROR] valid_idx ({valid_idx}) >= normalized_probs 长度 ({len(normalized_probs)})")
+                    # Fallback: 保持原样，但不更新 model_only_prob
+                    normalized_outcomes.append(outcome.copy())
+                else:
+                    updated_outcome = outcome.copy()
+                    
+                    # 更新 model_only_prob（纯AI预测，归一化后的值）
+                    normalized_value = round(normalized_probs[valid_idx], 2)
+                    updated_outcome["model_only_prob"] = normalized_value
+                    
+                    # 【Bug修复】验证归一化值是否合理
+                    if normalized_value < 0 or normalized_value > 100:
+                        print(f"⚠️ [WARNING] 归一化值异常：{outcome.get('name', i)} = {normalized_value}%")
+                    
+                    # 更新 prediction（融合后的概率）：需要重新融合
+                    market_prob = outcome.get("market_prob", 0)
+                    updated_prediction = (
+                        FusionEngine.MODEL_WEIGHT * normalized_probs[valid_idx] +
+                        FusionEngine.MARKET_WEIGHT * market_prob
+                    )
+                    updated_outcome["prediction"] = round(updated_prediction, 2)
+                    
+                    # 更新不确定度
+                    updated_outcome["uncertainty"] = round(normalized_uncertainties[valid_idx], 2)
+                    
+                    # 【新增】添加归一化标记
+                    updated_outcome["normalized"] = True
+                    
+                    normalized_outcomes.append(updated_outcome)
+                
+                valid_idx += 1
+        
+        # 【新增】为跳过的选项也添加 normalized 标记
+        for i, outcome in enumerate(normalized_outcomes):
+            if outcome.get("normalized") is None:
+                outcome["normalized"] = False  # 跳过的选项未归一化
+        
+        return {
+            "normalized_outcomes": normalized_outcomes,
+            "total_before": round(total_before, 2),
+            "total_after": round(total_after, 2),
+            "error": round(error, 4),
+            "skipped_count": len(skipped_indices),
+            "normalized": True,  # 标记已归一化
+            "event_type": event_type
+        }
+    
+    def _should_use_consensus_coef(self) -> bool:
+        """
+        决定是否启用共识加权（consensus coefficient）。
+        
+        Returns:
+            True if consensus coefficient should be used (default), False otherwise
+        """
+        if self.experiment_config is None:
+            return True  # Default: use consensus weighting
+        
+        try:
+            # Handle ExperimentConfig object or dict
+            if hasattr(self.experiment_config, 'config'):
+                config = self.experiment_config.config
+            else:
+                config = self.experiment_config
+            
+            return config.get("FUSION", {}).get("consensus_coef", True)
+        except Exception:
+            return True  # Default on error
+    
+    def _should_use_market_bias(self) -> bool:
+        """
+        决定是否启用市场偏差融合（market bias）。
+        
+        Returns:
+            True if market bias should be used (default), False otherwise
+        """
+        if self.experiment_config is None:
+            return True  # Default: use market bias
+        
+        try:
+            # Handle ExperimentConfig object or dict
+            if hasattr(self.experiment_config, 'config'):
+                config = self.experiment_config.config
+            else:
+                config = self.experiment_config
+            
+            return config.get("FUSION", {}).get("market_bias", True)
+        except Exception:
+            return True  # Default on error
+    
+    def _should_use_demarket_penalty(self) -> bool:
+        """
+        决定是否启用反市场跟踪惩罚（de-marketization penalty）。
+        
+        Returns:
+            True if de-marketization penalty should be applied, False otherwise (default: False for experiments)
+        """
+        if self.experiment_config is None:
+            return False  # Default: disabled (experimental feature)
+        
+        try:
+            # Handle ExperimentConfig object or dict
+            if hasattr(self.experiment_config, 'config'):
+                config = self.experiment_config.config
+            else:
+                config = self.experiment_config
+            
+            return config.get("FUSION", {}).get("demarket_penalty", False)
+        except Exception:
+            return False  # Default on error
+    
+    def _get_calibration_method(self) -> Optional[str]:
+        """
+        获取后校准方法。
+        
+        Returns:
+            Calibration method: "none", "binning", "platt", or None
+        """
+        if self.experiment_config is None:
+            return "none"  # Default: no calibration
+        
+        try:
+            # Handle ExperimentConfig object or dict
+            if hasattr(self.experiment_config, 'config'):
+                config = self.experiment_config.config
+            else:
+                config = self.experiment_config
+            
+            method = config.get("CALIBRATION", {}).get("post_calibration", "none")
+            if method in ["none", "binning", "platt"]:
+                return method
+            return "none"
+        except Exception:
+            return "none"  # Default on error
+    
+    def _apply_demarket_penalty(
+        self,
+        final_prob: float,
+        consensus_weight: float,
+        market_prob: float,
+        model_results: Dict[str, Dict]
+    ) -> Optional[Dict]:
+        """
+        应用反市场跟踪惩罚：如果AI预测与市场概率过于接近且共识度高，添加小扰动避免纯跟踪。
+        
+        Args:
+            final_prob: 当前融合后的概率
+            consensus_weight: 模型共识概率
+            market_prob: 市场价格
+            model_results: 模型结果字典
+        
+        Returns:
+            Dict with "adjusted_prob" if penalty applied, None otherwise
+        """
+        # Check if AI prediction is too close to market (within 2%)
+        ai_market_diff = abs(consensus_weight - market_prob)
+        
+        if ai_market_diff < 0.02:  # Less than 2% difference
+            # Calculate consensus (model agreement)
+            probs = [r["probability"] for r in model_results.values()]
+            if len(probs) > 1:
+                avg_prob = self._mean(probs)
+                if avg_prob > 0:
+                    consensus = 1.0 - (self._std(probs) / avg_prob)
+                else:
+                    consensus = 0.0
+            else:
+                consensus = 1.0
+            
+            # Only apply penalty if consensus is high (>0.8)
+            if consensus > 0.8:
+                # Determine perturbation direction based on minority opinion
+                # Use DeepSeek or Grok if available for minority signal
+                perturbation = 0.015  # ±1.5% perturbation
+                
+                # Try to get minority opinion (DeepSeek or Grok)
+                minority_prob = None
+                for model_name in ["deepseek-chat", "grok-4", "grok-3"]:
+                    if model_name in model_results:
+                        minority_prob = model_results[model_name]["probability"]
+                        break
+                
+                # If minority opinion exists and differs from consensus, use it for direction
+                if minority_prob is not None:
+                    if minority_prob > consensus_weight:
+                        adjusted_prob = final_prob + perturbation
+                    else:
+                        adjusted_prob = final_prob - perturbation
+                else:
+                    # Default: random direction (but deterministic based on prob value)
+                    adjusted_prob = final_prob + perturbation if (final_prob % 0.02) > 0.01 else final_prob - perturbation
+                
+                # Clip to [0, 100]
+                adjusted_prob = max(0.0, min(100.0, adjusted_prob))
+                
+                return {
+                    "adjusted_prob": adjusted_prob,
+                    "original_prob": final_prob,
+                    "perturbation": perturbation
+                }
+        
+        return None  # No penalty applied
+
+    @staticmethod
+    def _safe_float(value: Optional[float], default: float = 0.0) -> float:
+        """Convert value to float safely with default fallback."""
+        try:
+            if value is None:
+                return default
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _mean(values: List[float]) -> float:
+        """Return arithmetic mean with empty guard."""
+        if not values:
+            return 0.0
+        return math.fsum(values) / len(values)
+
+    @classmethod
+    def _std(cls, values: List[float]) -> float:
+        """Return population standard deviation using safe math."""
+        if not values:
+            return 0.0
+        mean_value = cls._mean(values)
+        variance = math.fsum((val - mean_value) ** 2 for val in values) / len(values)
+        return math.sqrt(variance)
+
+    @classmethod
+    def _weighted_mean(cls, values: List[float], weights: List[float]) -> float:
+        """Compute weighted mean with graceful fallback."""
+        if not values:
+            return 0.0
+        total_weight = math.fsum(weights) if weights else 0.0
+        if total_weight <= 0:
+            return cls._mean(values)
+        weighted_sum = math.fsum(val * weight for val, weight in zip(values, weights))
+        return weighted_sum / total_weight
+
+    @classmethod
+    def _weighted_std(cls, values: List[float], weights: List[float], mean_value: float) -> float:
+        """Compute weighted standard deviation with safe defaults."""
+        if not values:
+            return 0.0
+        total_weight = math.fsum(weights) if weights else 0.0
+        if total_weight <= 0:
+            # Fall back to unweighted std
+            return cls._std(values)
+        variance = math.fsum(
+            weight * ((val - mean_value) ** 2)
+            for val, weight in zip(values, weights)
+        ) / total_weight
+        variance = max(variance, 0.0)
+        return math.sqrt(variance)
+    
+    def _apply_calibration(self, prob: float, method: str) -> Optional[float]:
+        """
+        应用后校准（binning 或 platt scaling）。
+        
+        Args:
+            prob: 原始概率值 (0-100)
+            method: 校准方法 ("binning" or "platt")
+        
+        Returns:
+            校准后的概率值，如果校准未启用或失败则返回 None
+        """
+        if method == "none" or self.calibration_map is None:
+            return None  # No calibration configured
+        
+        try:
+            if method == "binning":
+                # Equal-frequency binning calibration
+                # calibration_map should be a dict: {bin_index: calibrated_prob}
+                # For simplicity, use linear interpolation if calibration_map is a function
+                if callable(self.calibration_map):
+                    return self.calibration_map(prob)
+                elif isinstance(self.calibration_map, dict):
+                    # Simple bin-based lookup (would need proper binning logic)
+                    # For now, return original (proper implementation would need historical data)
+                    return None
+                else:
+                    return None
+            
+            elif method == "platt":
+                # Platt scaling (logistic regression calibration)
+                # calibration_map should be fitted logistic regression parameters
+                # For now, placeholder - would need historical data to fit
+                return None
+            
+            return None
+        except Exception as e:
+            print(f"⚠️ 校准应用失败: {e}")
+            return None
+    
+    def fit_calibration(self, historical_data: Optional[List[Tuple[float, int]]] = None):
+        """
+        使用历史数据拟合校准模型（binning 或 platt scaling）。
+        
+        Args:
+            historical_data: List of (predicted_prob, true_label) tuples
+        """
+        # Placeholder for calibration fitting
+        # This would be implemented when historical data is available
+        calibration_method = self._get_calibration_method()
+        if calibration_method != "none" and historical_data:
+            # Fit calibration model here
+            # For now, calibration_map remains None
+            pass

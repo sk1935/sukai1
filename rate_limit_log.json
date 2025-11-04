@@ -1,0 +1,14 @@
+{
+  "newsapi": {
+    "calls": [
+      "2025-11-03T21:00:19.529341"
+    ],
+    "hourly_count": 1,
+    "reset_time": "2025-11-03T22:00:00"
+  },
+  "mediastack": {
+    "calls": [],
+    "hourly_count": 0,
+    "reset_time": null
+  }
+}

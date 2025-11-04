@@ -1,0 +1,16 @@
+# 实验配置示例（可选）
+# 可以通过环境变量或此文件配置实验开关
+
+FUSION:
+  consensus_coef: true      # 是否使用加权共识（加权平均 vs 简单平均）
+  market_bias: true         # 是否融合市场概率（80% AI + 20% 市场）
+  demarket_penalty: true    # 是否应用反从众系数（避免纯跟踪市场）
+
+CALIBRATION:
+  post_calibration: "none"  # 后置校准方法: "none" | "binning" | "platt"
+
+SENTIMENT:
+  reddit_bluesky: false     # 是否使用Reddit/Bluesky数据源（未来功能）
+
+
+

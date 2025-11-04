@@ -1,0 +1,73 @@
+{
+  "models": {
+    "gpt-4o": {
+      "display_name": "GPT-4o",
+      "model_id": "gpt-4o",
+      "source": "aicanapi",
+      "api_key_env": "AICANAPI_KEY",
+      "weight": 3.0,
+      "is_default": true,
+      "fallback": null,
+      "last_updated": "2024-11-21",
+      "description": "OpenAI GPT-4o - 默认主模型"
+    },
+    "claude": {
+      "display_name": "Claude-3.7-Sonnet",
+      "model_id": "claude-3-7-sonnet-latest",
+      "source": "aicanapi",
+      "api_key_env": "AICANAPI_KEY",
+      "weight": 2.5,
+      "is_default": false,
+      "fallback": "claude-3-5-opus-latest",
+      "fallback_display_name": "Claude-3.5-Opus",
+      "last_updated": "2025-01-27",
+      "description": "Anthropic Claude 3.7 Sonnet - 风险与批判性思维",
+      "opus_available": true,
+      "opus_model_id": "claude-3-5-opus-latest"
+    },
+    "gemini": {
+      "display_name": "Gemini-2.5-Pro",
+      "model_id": "gemini-2.5-pro",
+      "source": "aicanapi",
+      "api_key_env": "AICANAPI_KEY",
+      "weight": 2.0,
+      "is_default": false,
+      "fallback": "gemini-2.5-flash",
+      "fallback_display_name": "Gemini-2.5-Flash",
+      "last_updated": "2025-04-14",
+      "description": "Google Gemini 2.5 Pro - 模式识别与数据"
+    },
+    "grok": {
+      "display_name": "Grok-4",
+      "model_id": "grok-4",
+      "source": "aicanapi",
+      "api_key_env": "AICANAPI_KEY",
+      "weight": 2.0,
+      "is_default": false,
+      "fallback": "grok-3",
+      "fallback_display_name": "Grok-3",
+      "last_updated": "2025-01-27",
+      "description": "xAI Grok-4 - 另类视角",
+      "enabled": false
+    },
+    "deepseek": {
+      "display_name": "DeepSeek Chat",
+      "model_id": "deepseek-chat",
+      "source": "deepseek",
+      "api_key_env": "DEEPSEEK_API_KEY",
+      "weight": 2.0,
+      "is_default": false,
+      "fallback": null,
+      "last_updated": "2025-03-26",
+      "description": "DeepSeek Chat - 深度推理与量化分析",
+      "official_api": true
+    }
+  },
+  "api_endpoints": {
+    "aicanapi": "https://aicanapi.com/v1/chat/completions",
+    "deepseek": "https://api.deepseek.com/v1/chat/completions"
+  },
+  "version": "1.0.0",
+  "last_updated": "2025-01-27"
+}
+

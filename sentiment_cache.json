@@ -1,0 +1,106 @@
+{
+  "jinping out 2025": {
+    "keyword": "jinping out 2025",
+    "sentiment": "neutral",
+    "score": 0.0,
+    "sample_count": 20,
+    "source": "GDELT",
+    "timestamp": "2025-11-02T14:59:06.568608"
+  },
+  "gemini released": {
+    "keyword": "gemini released",
+    "sentiment": "neutral",
+    "score": 0.0,
+    "sample_count": 20,
+    "source": "GDELT",
+    "timestamp": "2025-11-02T21:10:28.526061"
+  },
+  "nobel peace prize": {
+    "keyword": "nobel peace prize",
+    "sentiment": "neutral",
+    "score": 0.0,
+    "sample_count": 20,
+    "source": "GDELT",
+    "timestamp": "2025-11-02T23:17:45.154464"
+  },
+  "china invade taiwan": {
+    "keyword": "china invade taiwan",
+    "sentiment": "neutral",
+    "score": 0.0,
+    "sample_count": 20,
+    "source": "GDELT",
+    "timestamp": "2025-11-02T23:32:47.914044"
+  },
+  "israel strike lebanon": {
+    "keyword": "israel strike lebanon",
+    "sentiment": "neutral",
+    "score": 0.0,
+    "sample_count": 20,
+    "source": "GDELT",
+    "timestamp": "2025-11-03T07:08:43.897035"
+  },
+  "monad airdrop": {
+    "keyword": "monad airdrop",
+    "sentiment": "neutral",
+    "score": 0.0,
+    "sample_count": 10,
+    "source": "GDELT",
+    "timestamp": "2025-11-03T20:11:42.732092"
+  },
+  "maduro out 2025": {
+    "keyword": "maduro out 2025",
+    "sentiment": "neutral",
+    "score": 0.05,
+    "sample_count": 98,
+    "source": "NewsAPI",
+    "timestamp": "2025-11-03T21:00:19.534823"
+  },
+  "https polymarket com": {
+    "keyword": "https polymarket com",
+    "sentiment": "neutral",
+    "score": 0.0,
+    "sample_count": 20,
+    "source": "GDELT",
+    "timestamp": "2025-11-04T07:24:58.519730"
+  },
+  "fed decision december": {
+    "keyword": "fed decision december",
+    "sentiment": "neutral",
+    "score": 0.0,
+    "sample_count": 20,
+    "source": "GDELT",
+    "timestamp": "2025-11-04T19:33:24.407093"
+  },
+  "maduro out": {
+    "keyword": "maduro out",
+    "sentiment": "neutral",
+    "score": 0.0,
+    "sample_count": 20,
+    "source": "GDELT",
+    "timestamp": "2025-11-04T19:44:29.339436"
+  },
+  "airbnb begin publicly": {
+    "keyword": "airbnb begin publicly",
+    "sentiment": "neutral",
+    "score": 0.0,
+    "sample_count": 10,
+    "source": "GDELT",
+    "timestamp": "2025-11-04T21:37:54.794608"
+  },
+  "zohran mamdani margin": {
+    "keyword": "zohran mamdani margin",
+    "sentiment": "neutral",
+    "score": 0.0,
+    "sample_count": 20,
+    "source": "GDELT",
+    "timestamp": "2025-11-04T21:39:37.675418"
+  },
+  "mamdani get over": {
+    "keyword": "mamdani get over",
+    "sentiment": "neutral",
+    "score": 0.0,
+    "sample_count": 20,
+    "source": "GDELT",
+    "timestamp": "2025-11-04T22:12:39.406812"
+  }
+}

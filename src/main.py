@@ -766,20 +766,33 @@ class ForecastingBot:
                         days_to_resolution,
                         uncertainty_ratio
                     )
+                    print(
+                        f"[TRADE_SIGNAL] computed option={top_outcome.get('name', 'N/A')} "
+                        f"signal={trade_data.get('signal')} ev={trade_data.get('ev')}"
+                    )
                     trade_signal_info = {
                         "option": top_outcome.get("name", "N/A"),
                         "data": trade_data
                     }
-                    top_outcome["trade_signal"] = trade_data
-                    event_data["trade_signal"] = trade_signal_info
                 
                 # Format multi-option output
                 # 传递归一化结果和 DeepSeek reasoning 给输出层
+                # 【修复】确保 fusion_result 包含 trade_signal 字段
+                multi_option_fusion_result = {"deepseek_reasoning": deepseek_reasoning}
+                if trade_signal_info and trade_signal_info.get("data"):
+                    # 将 trade signal 数据添加到 fusion_result 中
+                    multi_option_fusion_result["trade_signal"] = trade_signal_info.get("data")
+                    multi_option_fusion_result["ev"] = trade_signal_info.get("data", {}).get("ev")
+                    multi_option_fusion_result["annualized_ev"] = trade_signal_info.get("data", {}).get("annualized_ev")
+                    multi_option_fusion_result["risk_factor"] = trade_signal_info.get("data", {}).get("risk_factor")
+                    multi_option_fusion_result["signal"] = trade_signal_info.get("data", {}).get("signal")
+                    multi_option_fusion_result["signal_reason"] = trade_signal_info.get("data", {}).get("signal_reason")
+                
                 output = self.output_formatter.format_multi_option_prediction(
                     event_data=event_data,
                     outcomes=fused_outcomes,
                     normalization_info=normalization_result,  # 传递归一化信息
-                    fusion_result={"deepseek_reasoning": deepseek_reasoning},  # 传递 DeepSeek reasoning
+                    fusion_result=multi_option_fusion_result,  # 包含 trade_signal 字段
                     trade_signal=trade_signal_info
                 )
                 
@@ -847,13 +860,9 @@ class ForecastingBot:
                             fusion_result=aggregated_fusion_result,
                             full_analysis=full_analysis,
                             outcomes=fused_outcomes,
-                            normalization_info=normalization_result
+                            normalization_info=normalization_result,
+                            trade_signal=None
                         )
-                        if trade_signal_info and trade_signal_info.get("data"):
-                            self.notion_logger.log_trade_signal(
-                                event_data_for_notion.get("question", event_data.get("question", "-")),
-                                trade_signal_info["data"]
-                            )
                     except Exception as e:
                         print(f"⚠️ Notion Logger 记录失败: {e}")
             else:
@@ -1015,7 +1024,9 @@ class ForecastingBot:
                     ai_prob_trade = fusion_result.get("model_only_prob")
                     if ai_prob_trade is None:
                         ai_prob_trade = fusion_result.get("final_prob")
-                    market_prob_trade = event_data.get("market_prob") or fusion_result.get("final_prob")
+                    market_prob_trade = event_data.get("market_prob")
+                    # [FIX] Preserve legitimate 0.0 market probabilities when computing trade signals.
+                    market_prob_trade = market_prob_trade if market_prob_trade is not None else fusion_result.get("final_prob")
                     days_to_resolution = event_data.get("days_left") or 30
                     uncertainty_ratio = (fusion_result.get("uncertainty") or 0.0) / 100.0
                     trade_signal_data = self.fusion_engine.evaluate_trade_signal(
@@ -1024,7 +1035,17 @@ class ForecastingBot:
                         days_to_resolution,
                         uncertainty_ratio
                     )
+                    print(
+                        f"[TRADE_SIGNAL] computed event={event_data.get('question', 'N/A')} "
+                        f"signal={trade_signal_data.get('signal')} ev={trade_signal_data.get('ev')}"
+                    )
+                    # 【修复】确保 fusion_result 包含所有 trade signal 字段
                     fusion_result["trade_signal"] = trade_signal_data
+                    fusion_result["ev"] = trade_signal_data.get("ev")
+                    fusion_result["annualized_ev"] = trade_signal_data.get("annualized_ev")
+                    fusion_result["risk_factor"] = trade_signal_data.get("risk_factor")
+                    fusion_result["signal"] = trade_signal_data.get("signal")
+                    fusion_result["signal_reason"] = trade_signal_data.get("signal_reason")
                 
                 # Format and send output
                 output = self.output_formatter.format_prediction(
@@ -1077,7 +1098,8 @@ class ForecastingBot:
                             fusion_result=fusion_result_for_notion,
                             full_analysis=full_analysis,
                             outcomes=None,
-                            normalization_info=None
+                            normalization_info=None,
+                            trade_signal=None
                         )
                     except Exception as e:
                         print(f"⚠️ Notion Logger 记录失败: {e}")
@@ -1396,7 +1418,8 @@ def test_notion_write():
             fusion_result=test_fusion_result,
             full_analysis={"event_category": "system", "rules_summary": "写入测试"},
             outcomes=None,
-            normalization_info=None
+            normalization_info=None,
+            trade_signal=None
         )
         
         if result:

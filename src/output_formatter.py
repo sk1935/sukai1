@@ -12,6 +12,7 @@
 输出：格式化的中文 Markdown 字符串（Telegram 消息）
 """
 import re
+from difflib import SequenceMatcher
 from typing import Dict, List, Optional
 
 
@@ -30,56 +31,117 @@ class OutputFormatter:
         pass
 
     @staticmethod
-    def _build_trade_signal_banner(trade_data: Optional[Dict]) -> str:
+    def _extract_trade_signal_data(trade_data: Optional[Dict]) -> Dict:
+        """Return flattened trade signal dict regardless of wrapping."""
         if not trade_data:
-            return ""
-        signal = (trade_data.get("signal") or "HOLD").upper()
-        mapping = {
-            "BUY": "💰 AI predicts undervalued market, consider buying",
-            "SELL": "❌ Market overpriced, high risk of loss",
-            "HOLD": "⚠️ No clear edge — hold or wait"
-        }
-        text = mapping.get(signal, mapping["HOLD"])
-        return f"{text}\n\n"
+            return {}
+        if isinstance(trade_data, dict) and isinstance(trade_data.get("data"), dict):
+            return trade_data["data"]
+        if isinstance(trade_data, dict):
+            return trade_data
+        return {}
 
     @staticmethod
-    def _build_trade_signal_table(trade_info: Optional[Dict]) -> str:
-        if not trade_info:
+    def _trade_signal_icon(signal: Optional[str]) -> str:
+        signal_upper = (signal or "HOLD").upper()
+        icon_map = {
+            "BUY": "💰",
+            "SELL": "❌",
+            "HOLD": "⚠️",
+        }
+        return icon_map.get(signal_upper, "⚠️")
+
+    @staticmethod
+    def _sanitize_reasoning_text(text: Optional[str], context: str = "output") -> str:
+        if text is None:
             return ""
-        data = trade_info.get("data", {}) if isinstance(trade_info, dict) else trade_info
-        if not data:
+        cleaned = str(text)
+        original = cleaned
+        changed = False
+        fence_pattern = re.compile(r"```(?:json)?[\s\S]*?```", re.IGNORECASE)
+        new_cleaned = fence_pattern.sub("", cleaned)
+        if new_cleaned != cleaned:
+            cleaned = new_cleaned
+            changed = True
+        json_pattern = re.compile(r"\{[^{}]*:[^{}]*\}")
+        while True:
+            new_cleaned = json_pattern.sub("", cleaned)
+            if new_cleaned == cleaned:
+                break
+            cleaned = new_cleaned
+            changed = True
+        if cleaned.count("{") > cleaned.count("}"):
+            idx = cleaned.rfind("{")
+            if idx != -1:
+                cleaned = cleaned[:idx]
+                changed = True
+        cleaned = cleaned.replace("```", "")
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        if cleaned and cleaned[-1] in "{[,:":
+            terminators = [cleaned.rfind(ch) for ch in "。！？.!?"]
+            terminators = [idx for idx in terminators if idx != -1]
+            if terminators:
+                cleaned = cleaned[: max(terminators) + 1]
+                changed = True
+        if changed and cleaned != original:
+            print(f"[CLEANUP] Removed JSON artifacts ({context})")
+        return cleaned
+
+    @staticmethod
+    def _reasoning_similarity(text_a: str, text_b: str) -> float:
+        if not text_a or not text_b:
+            return 0.0
+        return SequenceMatcher(None, text_a, text_b).ratio()
+
+    @staticmethod
+    def _build_trade_signal_banner(trade_data: Optional[Dict]) -> str:
+        """Render concise trade signal banner for Telegram output."""
+        option_label = None
+        if isinstance(trade_data, dict):
+            option_label = trade_data.get("option") or trade_data.get("option_name")
+        data = OutputFormatter._extract_trade_signal_data(trade_data)
+        required_keys = ("signal", "ev", "annualized_ev", "risk_factor", "signal_reason")
+        # [FIX] Skip banner entirely when critical fields are missing to avoid noisy fallbacks.
+        if not data or any(data.get(key) in (None, "") for key in required_keys):
+            print("[TRADE_SIGNAL] banner unavailable (missing inputs)")
             return ""
-        ev = data.get("ev") or 0.0
-        annualized = data.get("annualized_ev") or 0.0
-        risk = data.get("risk_factor") or 0.0
+
         signal = (data.get("signal") or "HOLD").upper()
-        signal_map = {
-            "BUY": "💰 BUY",
-            "SELL": "❌ SELL",
-            "HOLD": "⚠️ HOLD"
-        }
-        signal_display = signal_map.get(signal, "⚠️ HOLD")
-        note_map = {
-            "BUY": "Positive expected value",
-            "SELL": "Risk elevated",
-            "HOLD": "Await better edge"
-        }
-        rows = [
-            ("EV", f"{ev:+.2f}", "AI–Market gap"),
-            ("Annualized EV", f"{annualized:+.2f}", "Time-adjusted"),
-            ("Risk Factor", f"{risk:.2f}", "Moderate"),
-            ("Signal", signal_display, note_map.get(signal, "Await better edge"))
-        ]
-        table_lines = ["| Metric | Value | Note |", "|---------|--------|------|"]
-        for metric, value, note in rows:
-            table_lines.append(f"| {metric} | {value} | {note} |")
-        return "\n".join(table_lines) + "\n\n"
+        icon = OutputFormatter._trade_signal_icon(signal)
+
+        def _fmt(value: Optional[float], signed: bool = False) -> str:
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                return "—"
+            return f"{numeric:+.2f}" if signed else f"{numeric:.2f}"
+
+        ev_display = _fmt(data.get("ev"), signed=True)
+        annualized_display = _fmt(data.get("annualized_ev"), signed=True)
+        risk_display = _fmt(data.get("risk_factor"))
+        reason_text = OutputFormatter.safe_markdown_text(str(data.get("signal_reason", "")).strip()[:200])
+
+        # [FIX] Include option context when available so users know which outcome the signal targets.
+        option_suffix = f" — {OutputFormatter.safe_markdown_text(option_label)}" if option_label else ""
+        banner = (
+            f"{icon} {signal}{option_suffix}\n"
+            f"EV: {ev_display} | Annualized EV: {annualized_display} | Risk: {risk_display}\n"
+            f"Reason: {reason_text}\n"
+        )
+        print(
+            f"[TRADE_SIGNAL] banner signal={signal} ev={ev_display} "
+            f"annualized={annualized_display} risk={risk_display}"
+        )
+        return banner
+
 
     @staticmethod
     def _finalize_reasoning_text(text: str, limit: int = 300) -> str:
         if not text:
             return ""
-        cleaned = text.replace("Parsed from unstructured response.", "").replace("Parsed from unstructured response", "").strip()
+        cleaned = OutputFormatter._sanitize_reasoning_text(text, context="output_formatting")
+        cleaned = cleaned.replace("Parsed from unstructured response.", "").replace("Parsed from unstructured response", "").strip()
+        
         truncated = False
         if len(cleaned) > limit:
             truncated = True
@@ -99,7 +161,7 @@ class OutputFormatter:
             cleaned = cleaned.rstrip('…') + "..."
         elif not truncated and cleaned and cleaned[-1] not in ('。', '！', '？', '.', '!', '?'):
             cleaned += "。"
-        print(f"[FORMAT] reasoning final_len={len(cleaned)} truncated={1 if truncated else 0}")
+        print(f"[SUMMARY] TruncatedReasoning(len={len(cleaned)})")
         return cleaned
 
     @staticmethod
@@ -109,15 +171,27 @@ class OutputFormatter:
         event_type = normalization_info.get("event_type", "unknown")
         normalized_flag = normalization_info.get("normalized", False)
         reason = normalization_info.get("reason")
+        total_before = normalization_info.get("total_before", 0.0)
+        
         banner = ""
+        # 检查是否显示安全归一化横幅（仅当原始总和 < 0.95 或 > 1.05 时）
+        guard_fraction = (total_before / 100.0) if total_before else 0.0
+        should_show_guard_banner = guard_fraction < 0.95 or guard_fraction > 1.05
+        
         if event_type == "mutually_exclusive" and normalized_flag:
             banner = "ℹ️ 互斥事件（所有选项已归一化为 100%）"
-            if reason == "sum_guard":
+            if reason == "sum_guard" and should_show_guard_banner:
                 banner += "\nℹ️ 安全归一化已启用（AI 预测总和异常，已缩放至 100%）"
-        elif reason == "sum_guard" and normalized_flag:
+                print(f"[FORMAT] NormalizationBanner shown (guard_fraction={guard_fraction:.3f})")
+            else:
+                print(f"[FORMAT] NormalizationBanner hidden (guard_fraction={guard_fraction:.3f} in range)")
+        elif reason == "sum_guard" and normalized_flag and should_show_guard_banner:
             banner = "ℹ️ 安全归一化已启用（AI 预测总和异常，已缩放至 100%）"
+            print(f"[FORMAT] NormalizationBanner shown (guard_fraction={guard_fraction:.3f})")
         elif event_type == "conditional" and not normalized_flag:
             banner = "ℹ️ *条件事件为独立市场（概率未归一化）*"
+        else:
+            print(f"[FORMAT] NormalizationBanner hidden (reason={reason}, normalized={normalized_flag})")
         if banner:
             log_banner = banner.replace('\n', ' ')
             print(f"[FORMAT] type={event_type} normalized={normalized_flag} banner=\"{log_banner}\"")
@@ -252,8 +326,15 @@ class OutputFormatter:
         question = event_data.get("question", "未知事件")
         question_escaped = self.safe_markdown_text(question)
         
-        # 标题
-        output = f"📊 *条件事件预测：* {question_escaped}\n\n"
+        # 标题：根据事件类型选择
+        event_type = normalization_info.get("event_type", "conditional") if normalization_info else "conditional"
+        if event_type == "mutually_exclusive":
+            title_type = "📊 多选项（互斥）预测："
+            print(f"[FORMAT] TitleType=mutually_exclusive")
+        else:
+            title_type = "📊 *条件事件预测：*"
+            print(f"[FORMAT] TitleType={event_type}")
+        output = f"{title_type} {question_escaped}\n\n"
         
         # 【集成】添加世界情绪和新闻摘要显示（条件型事件）
         full_analysis = event_data.get("full_analysis")
@@ -343,8 +424,15 @@ class OutputFormatter:
                         print(f"[WARNING] 检测到异常 AI 预测值：{name} = {ai_prob_val}%，可能存在归一化错误")
                     
                     if has_ai:
+                        # 【修复】转义 "<0" 为 "\\<0%"
+                        ai_prob_str = f"{ai_prob_val:.1f}%"
+                        if ai_prob_str.startswith("<0"):
+                            ai_prob_str = "\\<0%"
+                        elif "<0" in ai_prob_str:
+                            ai_prob_str = ai_prob_str.replace("<0", "\\<0")
+                        
                         output += f"• *{name_escaped}*\n"
-                        output += f"  AI预测: {ai_prob_val:.1f}% | 市场: {market_prob_val:.1f}%"
+                        output += f"  AI预测: {ai_prob_str} | 市场: {market_prob_val:.1f}%"
                         
                         # 计算偏差（使用归一化后的AI概率）
                         diff = ai_prob_val - market_prob_val
@@ -382,21 +470,19 @@ class OutputFormatter:
                     output += f"• *{name_escaped}*\n"
                     output += f"  市场: N/A\n\n"
         
-        if trade_signal and trade_signal.get("data"):
-            output += self._build_trade_signal_banner(trade_signal["data"])
-            output += self._build_trade_signal_table(trade_signal)
-        
         # AI逻辑摘要（使用第一个有效摘要）
         first_summary = None
+        finalized_summary_text = ""
         for outcome in sorted_outcomes:
             summary = outcome.get('summary', '')
             if summary and len(summary) > 30 and '暂无' not in summary:
                 first_summary = summary
                 break
-        
+
         if first_summary:
             finalized_summary = self._finalize_reasoning_text(first_summary, limit=400)
             if finalized_summary:
+                finalized_summary_text = finalized_summary
                 summary_escaped = self.safe_markdown_text(finalized_summary)
                 output += f"🧠 *AI逻辑摘要*\n\n{summary_escaped}\n\n"
         
@@ -451,8 +537,14 @@ class OutputFormatter:
         
         if deepseek_reasoning:
             finalized_deepseek = self._finalize_reasoning_text(deepseek_reasoning, limit=500)
-            deepseek_text = self.safe_markdown_text(finalized_deepseek)
-            deepseek_section = f"\n🧠 *模型洞察 \\(DeepSeek\\)*\n━━━━━━━━━━━━━━━━━━━━\n{deepseek_text}\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            if finalized_deepseek and finalized_summary_text:
+                similarity = self._reasoning_similarity(finalized_summary_text, finalized_deepseek)
+                if similarity >= 0.9:
+                    print("[FORMAT] Skipped redundant model insight")
+                    finalized_deepseek = ""
+            if finalized_deepseek:
+                deepseek_text = self.safe_markdown_text(finalized_deepseek)
+                deepseek_section = f"\n🧠 *模型洞察 \\(DeepSeek\\)*\n━━━━━━━━━━━━━━━━━━━━\n{deepseek_text}\n━━━━━━━━━━━━━━━━━━━━\n\n"
         
         # 风险提示
         output += "⚠️ *风险提示*\n"
@@ -509,6 +601,10 @@ class OutputFormatter:
                 print("⚙️ [SAFE] 修复空值保护: ai_total")
                 ai_total = 0.0
             output += f"📊 *AI预测总和：* {(ai_total or 0.0):.2f}%\n"
+
+        trade_banner = self._build_trade_signal_banner(trade_signal)
+        if trade_banner:
+            output += "\n" + trade_banner
         
         return output
     
@@ -596,7 +692,10 @@ class OutputFormatter:
         # Build output in Chinese
         # Escape special characters in user-provided content
         question_escaped = self.safe_markdown_text(event_data.get('question', '未知事件'))
-        summary_escaped = self.safe_markdown_text(fusion_result.get('summary', '暂无摘要'))
+        finalized_logic_summary = self._finalize_reasoning_text(fusion_result.get('summary', '暂无摘要'), limit=400)
+        if not finalized_logic_summary:
+            finalized_logic_summary = "暂无摘要"
+        summary_escaped = self.safe_markdown_text(finalized_logic_summary)
         rules_escaped = self.safe_markdown_text(short_rules)
         
         # 【修复】确保 model_only_prob 不为 None 且为数值类型
@@ -616,8 +715,14 @@ class OutputFormatter:
         deepseek_section = ""
         if deepseek_reasoning:
             finalized_deepseek = self._finalize_reasoning_text(deepseek_reasoning, limit=500)
-            deepseek_text = self.safe_markdown_text(finalized_deepseek)
-            deepseek_section = f"\n🧠 *模型洞察 \\(DeepSeek\\)*\n━━━━━━━━━━━━━━━━━━━━\n{deepseek_text}\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            if finalized_deepseek and finalized_logic_summary:
+                similarity = self._reasoning_similarity(finalized_logic_summary, finalized_deepseek)
+                if similarity >= 0.9:
+                    print("[FORMAT] Skipped redundant model insight")
+                    finalized_deepseek = ""
+            if finalized_deepseek:
+                deepseek_text = self.safe_markdown_text(finalized_deepseek)
+                deepseek_section = f"\n🧠 *模型洞察 \\(DeepSeek\\)*\n━━━━━━━━━━━━━━━━━━━━\n{deepseek_text}\n━━━━━━━━━━━━━━━━━━━━\n\n"
         
         # Model versions section
         model_versions = fusion_result.get('model_versions', {})
@@ -807,17 +912,17 @@ class OutputFormatter:
         if fusion_result.get("demarket_applied"):
             demarket_note = f"\n💡 {fusion_result.get('demarket_note', 'Applied de-marketization penalty.')}\n"
         
-        trade_banner = self._build_trade_signal_banner(trade_signal)
-        trade_table = self._build_trade_signal_table(trade_signal)
-        
         output = f"""📊 *事件:* {question_escaped}
 
 {analysis_section}{ai_prediction_line}
 📈 *市场价格:* {(market_prob or 0.0):.1f}%
 🧠 *融合预测:* {(final_prob or 0.0):.1f}% (80% AI + 20% 市场)
-{trade_banner}{trade_table}{demarket_note}{deepseek_section}{versions_section}{weight_source_section}{evaluation_section}💬 *摘要:* {summary_escaped}
+{demarket_note}{deepseek_section}{versions_section}{weight_source_section}{evaluation_section}💬 *摘要:* {summary_escaped}
 ⚖️ *分歧程度:* {disagreement_cn}
 📜 *规则:* {rules_escaped}"""
+        trade_banner = self._build_trade_signal_banner(trade_signal)
+        if trade_banner:
+            output += "\n" + trade_banner
         
         return output
     
@@ -1031,6 +1136,10 @@ class OutputFormatter:
             
             # Escape parentheses in diff_str to prevent Markdown parsing errors
             # Note: diff_str format is like "+1.5%" or "-2.3%", which may contain special chars
+            # 【修复】类型安全检查：确保 diff_str 是字符串类型
+            if not isinstance(diff_str, str):
+                diff_str = str(diff_str)
+                print(f"[SAFE_REPLACE] Converted diff_str to str before replace() in output_formatter.py:1090")
             diff_str_escaped = diff_str.replace('(', '\\(').replace(')', '\\)')
             
             # Format the option line carefully
@@ -1053,8 +1162,15 @@ class OutputFormatter:
                 if market is None:
                     print(f"⚠️ market is None for {name}, using default 0.0")
                     market = 0.0
+                # 【修复】转义 "<0" 为 "\\<0%"
+                ai_display_str = f"{(ai_display or 0.0):.1f}%"
+                if ai_display_str.startswith("<0"):
+                    ai_display_str = "\\<0%"
+                elif "<0" in ai_display_str:
+                    ai_display_str = ai_display_str.replace("<0", "\\<0")
+                
                 output += f"""{emoji} *{i}.* {name}
-   🤖 AI预测: {(ai_display or 0.0):.1f}% ± {(uncertainty or 0.0):.1f}%
+   🤖 AI预测: {ai_display_str} ± {(uncertainty or 0.0):.1f}%
    📈 市场价格: {(market or 0.0):.1f}% ({diff_str_escaped})
    
 """
@@ -1087,10 +1203,6 @@ class OutputFormatter:
                     print(f"⚠️ market_prob is None for {name_escaped}, using default 0.0")
                     market_prob = 0.0
                 output += f"  • {name_escaped}: {(prediction or 0.0):.1f}% \\(市场: {(market_prob or 0.0):.1f}%\\)\n"
-        
-        if trade_signal and trade_signal.get("data"):
-            output += self._build_trade_signal_banner(trade_signal["data"])
-            output += self._build_trade_signal_table(trade_signal)
         
         # Add rules if available
         rules = event_data.get("rules", "")
@@ -1174,6 +1286,9 @@ class OutputFormatter:
         
         if combined_sections:
             output = output.rstrip('\n') + combined_sections
+        trade_banner = self._build_trade_signal_banner(trade_signal)
+        if trade_banner:
+            output += "\n" + trade_banner
         
         return output
     

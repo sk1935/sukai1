@@ -130,7 +130,8 @@ class NotionLogger:
                                 outcome: Optional[Dict] = None, 
                                 full_analysis: Optional[Dict] = None,
                                 normalization_info: Optional[Dict] = None,
-                                ai_sum: Optional[float] = None) -> Dict:
+                                ai_sum: Optional[float] = None,
+                                trade_signal: Optional[Dict] = None) -> Dict:
         """
         创建 Notion 页面属性
         
@@ -266,12 +267,88 @@ class NotionLogger:
             }
         }
         
+        # Add trade signal fields if available
+        if trade_signal:
+            # Handle both formats: direct dict or nested {"data": {...}}
+            signal_data = trade_signal.get("data", {}) if isinstance(trade_signal, dict) and "data" in trade_signal else trade_signal
+            if signal_data:
+                ev = signal_data.get("ev")
+                annualized_ev = signal_data.get("annualized_ev")
+                risk_factor = signal_data.get("risk_factor")
+                signal = signal_data.get("signal", "HOLD")
+                signal_reason = signal_data.get("signal_reason", "")
+                
+                # Only add properties if they exist (safe fallback)
+                # 【修复】使用标准属性名称：EV, AnnualizedEV, RiskFactor, TradeSignal, TradeReason
+                try:
+                    if ev is not None:
+                        properties["EV"] = {"number": round(float(ev), 4)}
+                except Exception:
+                    pass  # Skip if property doesn't exist
+                
+                try:
+                    if annualized_ev is not None:
+                        properties["AnnualizedEV"] = {"number": round(float(annualized_ev), 4)}
+                except Exception:
+                    pass  # Skip if property doesn't exist
+                
+                try:
+                    if risk_factor is not None:
+                        properties["RiskFactor"] = {"number": round(float(risk_factor), 3)}
+                except Exception:
+                    pass  # Skip if property doesn't exist
+                
+                try:
+                    if signal:
+                        properties["TradeSignal"] = {"rich_text": [{"text": {"content": str(signal)}}]}
+                except Exception:
+                    pass  # Skip if property doesn't exist
+                
+                try:
+                    if signal_reason:
+                        properties["TradeReason"] = {"rich_text": [{"text": {"content": str(signal_reason)[:500]}}]}
+                except Exception:
+                    pass  # Skip if property doesn't exist
+        
         return properties
+
+    def log_trade_signal(self, event_name: str, trade_data: Optional[Dict]) -> None:
+        """Emit a concise log line for trade signal data being written to Notion."""
+        if not trade_data:
+            print(f"[TRADE_SIGNAL] No trade signal for {event_name}")
+            return
+        signal_data = trade_data.get("data", {}) if isinstance(trade_data, dict) and isinstance(trade_data.get("data"), dict) else trade_data
+        if not isinstance(signal_data, dict) or not signal_data:
+            print(f"[TRADE_SIGNAL] Invalid trade signal payload for {event_name}")
+            return
+
+        signal = (signal_data.get("signal") or "HOLD").upper()
+        ev = signal_data.get("ev")
+        annualized = signal_data.get("annualized_ev")
+        risk_factor = signal_data.get("risk_factor")
+        reason = (signal_data.get("signal_reason") or "").strip()
+
+        def _fmt(value: Optional[float], signed: bool = False) -> str:
+            if value is None:
+                return "—"
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                return "—"
+            return f"{numeric:+.2f}" if signed else f"{numeric:.2f}"
+
+        print(
+            f"[TRADE_SIGNAL] logging {signal} ev={_fmt(ev, True)} "
+            f"aev={_fmt(annualized, True)} risk={_fmt(risk_factor)} event=\"{event_name[:80]}\""
+        )
+        if reason:
+            print(f"[TRADE_SIGNAL] reason: {reason[:160]}")
     
     def log_prediction(self, event_data: Dict, fusion_result: Dict,
                       full_analysis: Optional[Dict] = None,
                       outcomes: Optional[List[Dict]] = None,
-                      normalization_info: Optional[Dict] = None) -> bool:
+                      normalization_info: Optional[Dict] = None,
+                      trade_signal: Optional[Dict] = None) -> bool:
         """
         记录预测结果到 Notion 数据库
         
@@ -281,6 +358,7 @@ class NotionLogger:
             full_analysis: 完整分析结果（可选，包含 event_category, rules_summary 等）
             outcomes: 多选项事件的选项列表（可选）
             normalization_info: 归一化信息（可选，用于计算总和）
+            trade_signal: 交易信号数据（可选，包含 ev、annualized_ev、risk_factor、signal 等）
         
         Returns:
             是否成功写入
@@ -301,6 +379,8 @@ class NotionLogger:
         
         try:
             event_name = event_data.get("question", "未知事件")
+            if trade_signal:
+                self.log_trade_signal(event_name, trade_signal)
             timestamp_utc = datetime.now(timezone.utc).isoformat()
             
             # 检查重复记录（简化检查，避免因属性不存在而失败）
@@ -329,7 +409,8 @@ class NotionLogger:
                         outcome=outcome,
                         full_analysis=full_analysis,
                         normalization_info=normalization_info,
-                        ai_sum=ai_sum
+                        ai_sum=ai_sum,
+                        trade_signal=trade_signal
                     )
                     
                     # 检查是否重复（基于事件名称、选项名称和时间戳）
@@ -404,7 +485,8 @@ class NotionLogger:
                     outcome=None,
                     full_analysis=full_analysis,
                     normalization_info=normalization_info,
-                    ai_sum=None
+                    ai_sum=None,
+                    trade_signal=trade_signal
                 )
                 
                 if existing_page_id:
@@ -480,4 +562,3 @@ class NotionLogger:
                 print("   💡 可能原因: Integration 没有写入权限，请在 Notion 中授予权限")
             
             return False
-

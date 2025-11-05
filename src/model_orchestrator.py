@@ -623,6 +623,11 @@ class ModelOrchestrator:
             "confidence": "low",
             "reasoning": "No response received"
         }
+
+        # [FIX] Guard against empty model batches so asyncio.wait isn't invoked with no tasks.
+        if not model_names:
+            print("[WARN] No active models to call.")
+            return {}
         
         async def guarded_call(model_name: str) -> Tuple[str, Optional[Dict]]:
             async with semaphore:
@@ -644,6 +649,10 @@ class ModelOrchestrator:
                     }
         
         tasks = [asyncio.create_task(guarded_call(name)) for name in model_names]
+        # [FIX] Double-check tasks list because filters above might drop every model.
+        if not tasks:
+            print("[WARN] No active models to call.")
+            return {}
         results_dict: Dict[str, Optional[Dict]] = {}
         
         done, pending = await asyncio.wait(

@@ -380,7 +380,8 @@ class FusionEngine:
         for key in ("reasoning_short", "reasoning_long", "reasoning"):
             value = result.get(key)
             if value:
-                cleaned = value.replace("Parsed from unstructured response.", "").replace("Parsed from unstructured response", "").strip()
+                cleaned = self._sanitize_reasoning_fragment(value, context=f"fusion_{key}")
+                cleaned = cleaned.replace("Parsed from unstructured response.", "").replace("Parsed from unstructured response", "").strip()
                 if cleaned:
                     pieces.append(cleaned)
         combined = " ".join(pieces).strip()
@@ -389,6 +390,42 @@ class FusionEngine:
         combined = self._safe_shorten_text(combined, limit=800)
         print(f"[COMBINE] reasoning_merged (final_len={len(combined)})")
         return combined
+
+    @staticmethod
+    def _sanitize_reasoning_fragment(value: Optional[str], context: str = "fusion") -> str:
+        if value is None:
+            return ""
+        cleaned = str(value)
+        original = cleaned
+        changed = False
+        fence_pattern = re.compile(r"```(?:json)?[\s\S]*?```", re.IGNORECASE)
+        new_cleaned = fence_pattern.sub("", cleaned)
+        if new_cleaned != cleaned:
+            cleaned = new_cleaned
+            changed = True
+        json_pattern = re.compile(r"\{[^{}]*:[^{}]*\}")
+        while True:
+            new_cleaned = json_pattern.sub("", cleaned)
+            if new_cleaned == cleaned:
+                break
+            cleaned = new_cleaned
+            changed = True
+        if cleaned.count("{") > cleaned.count("}"):
+            idx = cleaned.rfind("{")
+            if idx != -1:
+                cleaned = cleaned[:idx]
+                changed = True
+        cleaned = cleaned.replace("```", "")
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        if cleaned and cleaned[-1] in "{[,:":
+            terminators = [cleaned.rfind(ch) for ch in "。！？.!?"]
+            terminators = [idx for idx in terminators if idx != -1]
+            if terminators:
+                cleaned = cleaned[: max(terminators) + 1]
+                changed = True
+        if changed and cleaned != original:
+            print(f"[CLEANUP] Removed JSON artifacts ({context})")
+        return cleaned
     
     @staticmethod
     def classify_multi_option_event(
@@ -756,7 +793,8 @@ class FusionEngine:
                 "skipped_count": len(outcomes) - len(filtered_outcomes),
                 "normalized": False,
                 "event_type": event_type,
-                "reason": None
+                "reason": None,
+                "normalization_reason": "ok"  # 条件事件不归一化，标记为 "ok"
             }
         
         # 互斥事件：执行归一化（原有逻辑）
@@ -894,6 +932,13 @@ class FusionEngine:
             if outcome.get("normalized") is None:
                 outcome["normalized"] = False  # 跳过的选项未归一化
         
+        # 【修复】添加 normalization_reason: "sum_guard_scaled" 或 "ok"
+        normalization_reason_value = "ok"
+        if normalize_reason == "sum_guard":
+            normalization_reason_value = "sum_guard_scaled"
+        elif normalize_reason == "type":
+            normalization_reason_value = "ok"  # 正常归一化
+        
         return {
             "normalized_outcomes": normalized_outcomes,
             "total_before": round(total_before, 2),
@@ -902,7 +947,8 @@ class FusionEngine:
             "skipped_count": len(skipped_indices),
             "normalized": True,  # 标记已归一化
             "event_type": event_type,
-            "reason": normalize_reason
+            "reason": normalize_reason,
+            "normalization_reason": normalization_reason_value  # 新增字段
         }
     
     def _should_use_consensus_coef(self) -> bool:
@@ -1147,8 +1193,14 @@ class FusionEngine:
         """Evaluate a simple trade signal using EV and risk heuristics."""
         ai_val = FusionEngine._safe_float(ai_prob)
         market_val = FusionEngine._safe_float(market_prob)
-        days = days_to_resolution if days_to_resolution and days_to_resolution > 0 else 1
-        days = max(1, int(days))
+        days_raw = days_to_resolution if days_to_resolution and days_to_resolution > 0 else 1
+        # [FIX] Normalize resolution days with float guard for EV/risk calculations.
+        try:
+            days = float(days_raw or 1.0)
+        except (TypeError, ValueError):
+            print("[FIX] Invalid days_to_resolution for trade signal; defaulting to 1.0")
+            days = 1.0
+        days = max(1.0, days)
         ev = ai_val - market_val
         annualized_ev = 0.0
         try:
@@ -1156,13 +1208,20 @@ class FusionEngine:
         except Exception:
             annualized_ev = 0.0
         uncertainty = FusionEngine._safe_float(event_uncertainty)
-        risk_factor = uncertainty + ((days_to_resolution or 0.0) * volatility_coefficient)
+        # [FIX] Use sanitized day value so risk factor remains stable for string inputs.
+        risk_factor = uncertainty + (days * volatility_coefficient)
 
         signal = "HOLD"
+        signal_reason = "Await better edge"
         if annualized_ev > 0.05 and risk_factor < 0.6:
             signal = "BUY"
+            signal_reason = f"Positive EV ({annualized_ev:.2f}%) with low risk ({risk_factor:.2f})"
         elif annualized_ev < -0.05 or risk_factor > 0.8:
             signal = "SELL"
+            if annualized_ev < -0.05:
+                signal_reason = f"Negative EV ({annualized_ev:.2f}%), market overpriced"
+            else:
+                signal_reason = f"High risk factor ({risk_factor:.2f}), avoid position"
         print(
             f"[TRADE] Signal={signal}, EV={(ev or 0.0):.3f}, "
             f"Annualized={(annualized_ev or 0.0):.3f}, Risk={(risk_factor or 0.0):.2f}"
@@ -1171,7 +1230,8 @@ class FusionEngine:
             "signal": signal,
             "ev": round(ev or 0.0, 4),
             "annualized_ev": round(annualized_ev or 0.0, 4),
-            "risk_factor": round(risk_factor or 0.0, 3)
+            "risk_factor": round(risk_factor or 0.0, 3),
+            "signal_reason": signal_reason
         }
     
     def _apply_calibration(self, prob: float, method: str) -> Optional[float]:

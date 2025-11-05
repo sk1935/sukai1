@@ -7,14 +7,6 @@
     "source": "GDELT",
     "timestamp": "2025-11-02T14:59:06.568608"
   },
-  "gemini released": {
-    "keyword": "gemini released",
-    "sentiment": "neutral",
-    "score": 0.0,
-    "sample_count": 20,
-    "source": "GDELT",
-    "timestamp": "2025-11-02T21:10:28.526061"
-  },
   "nobel peace prize": {
     "keyword": "nobel peace prize",
     "sentiment": "neutral",
@@ -63,14 +55,6 @@
     "source": "GDELT",
     "timestamp": "2025-11-04T07:24:58.519730"
   },
-  "fed decision december": {
-    "keyword": "fed decision december",
-    "sentiment": "neutral",
-    "score": 0.0,
-    "sample_count": 20,
-    "source": "GDELT",
-    "timestamp": "2025-11-04T19:33:24.407093"
-  },
   "maduro out": {
     "keyword": "maduro out",
     "sentiment": "neutral",
@@ -87,14 +71,6 @@
     "source": "GDELT",
     "timestamp": "2025-11-04T21:37:54.794608"
   },
-  "zohran mamdani margin": {
-    "keyword": "zohran mamdani margin",
-    "sentiment": "neutral",
-    "score": 0.0,
-    "sample_count": 20,
-    "source": "GDELT",
-    "timestamp": "2025-11-04T21:39:37.675418"
-  },
   "mamdani get over": {
     "keyword": "mamdani get over",
     "sentiment": "neutral",
@@ -102,5 +78,85 @@
     "sample_count": 20,
     "source": "GDELT",
     "timestamp": "2025-11-04T22:12:39.406812"
+  },
+  "zohran mamdani margin": {
+    "keyword": "zohran mamdani margin",
+    "sentiment": "neutral",
+    "score": 0.05,
+    "sample_count": 87,
+    "source": "NewsAPI",
+    "timestamp": "2025-11-05T07:03:52.023542"
+  },
+  "new jersey governor": {
+    "keyword": "new jersey governor",
+    "sentiment": "neutral",
+    "score": 0.0,
+    "sample_count": 20,
+    "source": "GDELT",
+    "timestamp": "2025-11-05T07:33:17.020235"
+  },
+  "when government shutdown": {
+    "keyword": "when government shutdown",
+    "sentiment": "neutral",
+    "score": 0.0,
+    "sample_count": 20,
+    "source": "GDELT",
+    "timestamp": "2025-11-05T08:29:55.948735"
+  },
+  "supreme court rules": {
+    "keyword": "supreme court rules",
+    "sentiment": "neutral",
+    "score": 0.0,
+    "sample_count": 20,
+    "source": "GDELT",
+    "timestamp": "2025-11-05T09:19:32.183725"
+  },
+  "2nd largest company": {
+    "keyword": "2nd largest company",
+    "sentiment": "neutral",
+    "score": 0.0,
+    "sample_count": 20,
+    "source": "GDELT",
+    "timestamp": "2025-11-05T10:55:25.675775"
+  },
+  "democratic sweep": {
+    "keyword": "democratic sweep",
+    "sentiment": "neutral",
+    "score": 0.0,
+    "sample_count": 20,
+    "source": "GDELT",
+    "timestamp": "2025-11-05T11:57:37.132220"
+  },
+  "what mamdani say": {
+    "keyword": "what mamdani say",
+    "sentiment": "neutral",
+    "score": 0.0,
+    "sample_count": 20,
+    "source": "GDELT",
+    "timestamp": "2025-11-05T12:14:16.805554"
+  },
+  "which party win": {
+    "keyword": "which party win",
+    "sentiment": "neutral",
+    "score": 0.0,
+    "sample_count": 20,
+    "source": "GDELT",
+    "timestamp": "2025-11-05T12:41:51.668545"
+  },
+  "fed decision december": {
+    "keyword": "fed decision december",
+    "sentiment": "neutral",
+    "score": 0.0,
+    "sample_count": 20,
+    "source": "GDELT",
+    "timestamp": "2025-11-05T18:33:22.923203"
+  },
+  "gemini released": {
+    "keyword": "gemini released",
+    "sentiment": "neutral",
+    "score": 0.0,
+    "sample_count": 20,
+    "source": "GDELT",
+    "timestamp": "2025-11-05T18:40:32.299720"
   }
 }

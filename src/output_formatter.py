@@ -11,6 +11,7 @@
 输入：事件数据 + 融合结果
 输出：格式化的中文 Markdown 字符串（Telegram 消息）
 """
+import json
 import re
 from difflib import SequenceMatcher
 from typing import Dict, List, Optional
@@ -32,11 +33,7 @@ class OutputFormatter:
 
     @staticmethod
     def _extract_trade_signal_data(trade_data: Optional[Dict]) -> Dict:
-        """Return flattened trade signal dict regardless of wrapping."""
-        if not trade_data:
-            return {}
-        if isinstance(trade_data, dict) and isinstance(trade_data.get("data"), dict):
-            return trade_data["data"]
+        """Return the trade signal dict when already supplied as a flat structure."""
         if isinstance(trade_data, dict):
             return trade_data
         return {}
@@ -55,7 +52,13 @@ class OutputFormatter:
     def _sanitize_reasoning_text(text: Optional[str], context: str = "output") -> str:
         if text is None:
             return ""
-        cleaned = str(text)
+        if isinstance(text, (dict, list)):
+            try:
+                cleaned = json.dumps(text, ensure_ascii=False)
+            except (TypeError, ValueError):
+                cleaned = str(text)
+        else:
+            cleaned = str(text)
         original = cleaned
         changed = False
         fence_pattern = re.compile(r"```(?:json)?[\s\S]*?```", re.IGNORECASE)
@@ -171,7 +174,10 @@ class OutputFormatter:
         event_type = normalization_info.get("event_type", "unknown")
         normalized_flag = normalization_info.get("normalized", False)
         reason = normalization_info.get("reason")
-        total_before = normalization_info.get("total_before", 0.0)
+        raw_total_before = normalization_info.get("total_before")
+        total_before = raw_total_before if isinstance(raw_total_before, (int, float)) else None
+        if total_before is None:
+            total_before = 0.0
         
         banner = ""
         # 检查是否显示安全归一化横幅（仅当原始总和 < 0.95 或 > 1.05 时）

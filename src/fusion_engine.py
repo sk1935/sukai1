@@ -17,7 +17,7 @@ import math
 import time
 import re
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 from datetime import datetime, timezone
 
 
@@ -392,10 +392,19 @@ class FusionEngine:
         return combined
 
     @staticmethod
-    def _sanitize_reasoning_fragment(value: Optional[str], context: str = "fusion") -> str:
+    def _sanitize_reasoning_fragment(
+        value: Optional[Union[str, Dict[str, Any], List[Any]]],
+        context: str = "fusion"
+    ) -> str:
         if value is None:
             return ""
-        cleaned = str(value)
+        if isinstance(value, (dict, list)):
+            try:
+                cleaned = json.dumps(value, ensure_ascii=False)
+            except (TypeError, ValueError):
+                cleaned = str(value)
+        else:
+            cleaned = str(value)
         original = cleaned
         changed = False
         fence_pattern = re.compile(r"```(?:json)?[\s\S]*?```", re.IGNORECASE)

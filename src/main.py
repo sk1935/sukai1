@@ -771,22 +771,24 @@ class ForecastingBot:
                         f"signal={trade_data.get('signal')} ev={trade_data.get('ev')}"
                     )
                     trade_signal_info = {
+                        **trade_data,
                         "option": top_outcome.get("name", "N/A"),
-                        "data": trade_data
+                        "option_id": top_outcome.get("id"),
+                        "option_slug": top_outcome.get("slug")
                     }
                 
                 # Format multi-option output
                 # 传递归一化结果和 DeepSeek reasoning 给输出层
                 # 【修复】确保 fusion_result 包含 trade_signal 字段
                 multi_option_fusion_result = {"deepseek_reasoning": deepseek_reasoning}
-                if trade_signal_info and trade_signal_info.get("data"):
+                if trade_signal_info:
                     # 将 trade signal 数据添加到 fusion_result 中
-                    multi_option_fusion_result["trade_signal"] = trade_signal_info.get("data")
-                    multi_option_fusion_result["ev"] = trade_signal_info.get("data", {}).get("ev")
-                    multi_option_fusion_result["annualized_ev"] = trade_signal_info.get("data", {}).get("annualized_ev")
-                    multi_option_fusion_result["risk_factor"] = trade_signal_info.get("data", {}).get("risk_factor")
-                    multi_option_fusion_result["signal"] = trade_signal_info.get("data", {}).get("signal")
-                    multi_option_fusion_result["signal_reason"] = trade_signal_info.get("data", {}).get("signal_reason")
+                    multi_option_fusion_result["trade_signal"] = trade_signal_info
+                    multi_option_fusion_result["ev"] = trade_signal_info.get("ev")
+                    multi_option_fusion_result["annualized_ev"] = trade_signal_info.get("annualized_ev")
+                    multi_option_fusion_result["risk_factor"] = trade_signal_info.get("risk_factor")
+                    multi_option_fusion_result["signal"] = trade_signal_info.get("signal")
+                    multi_option_fusion_result["signal_reason"] = trade_signal_info.get("signal_reason")
                 
                 output = self.output_formatter.format_multi_option_prediction(
                     event_data=event_data,
@@ -1209,6 +1211,7 @@ def list_models():
 def main():
     """Main entry point."""
     load_dotenv()
+    _validate_required_environment()
     
     # Check for --list-models command early to support offline diagnostics
     if len(sys.argv) > 1 and sys.argv[1] == "--list-models":
@@ -1440,3 +1443,20 @@ if __name__ == "__main__":
         test_notion_write()
     else:
         main()
+REQUIRED_ENV_VARS = (
+    "TELEGRAM_BOT_TOKEN",
+    "AICANAPI_KEY",
+    "DEEPSEEK_API_KEY",
+    "OPENROUTER_API_KEY",
+    "NOTION_TOKEN",
+    "NOTION_DB_ID",
+    "POLYMARKET_API_KEY"
+)
+
+
+def _validate_required_environment() -> None:
+    """Ensure all critical environment variables exist before bootstrapping."""
+    missing = [key for key in REQUIRED_ENV_VARS if not os.environ.get(key)]
+    if missing:
+        missing_list = ", ".join(missing)
+        sys.exit(f"Error: Missing required environment variable(s): {missing_list}")

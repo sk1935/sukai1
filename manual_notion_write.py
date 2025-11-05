@@ -2,6 +2,7 @@
 """
 手动将最近一次预测结果写入 Notion
 """
+import asyncio
 import sys
 import os
 from pathlib import Path
@@ -153,13 +154,13 @@ def write_latest_prediction():
     # 写入 Notion
     print("📝 正在写入 Notion...")
     try:
-        result = logger.log_prediction(
+        result = asyncio.run(logger.log_prediction(
             event_data=event_data,
             fusion_result=aggregated_fusion_result,
             full_analysis=full_analysis,
             outcomes=fused_outcomes,
             normalization_info=normalization_info
-        )
+        ))
         
         if result:
             print()
@@ -186,4 +187,3 @@ def write_latest_prediction():
 if __name__ == "__main__":
     success = write_latest_prediction()
     sys.exit(0 if success else 1)
-

@@ -6,6 +6,7 @@ Notion Logger：自动保存预测结果到 Notion 数据库
 - 避免重复写入（基于事件名称和时间戳）
 - 支持简单限流（每次写入间隔≥5秒）
 """
+import asyncio
 import os
 import time
 import uuid
@@ -45,6 +46,7 @@ class NotionLogger:
         """
         # 再次确保环境变量已加载（防止调用时还未加载）
         load_dotenv()
+        self.notion_lock = asyncio.Lock()
         
         self.notion_token = notion_token or os.getenv("NOTION_TOKEN")
         self.database_id = database_id or os.getenv("NOTION_DB_ID")
@@ -344,11 +346,11 @@ class NotionLogger:
         if reason:
             print(f"[TRADE_SIGNAL] reason: {reason[:160]}")
     
-    def log_prediction(self, event_data: Dict, fusion_result: Dict,
-                      full_analysis: Optional[Dict] = None,
-                      outcomes: Optional[List[Dict]] = None,
-                      normalization_info: Optional[Dict] = None,
-                      trade_signal: Optional[Dict] = None) -> bool:
+    async def log_prediction(self, event_data: Dict, fusion_result: Dict,
+                             full_analysis: Optional[Dict] = None,
+                             outcomes: Optional[List[Dict]] = None,
+                             normalization_info: Optional[Dict] = None,
+                             trade_signal: Optional[Dict] = None) -> bool:
         """
         记录预测结果到 Notion 数据库
         
@@ -373,58 +375,70 @@ class NotionLogger:
             print("⚠️ Notion Logger: 客户端未初始化，跳过记录")
             return False
         
-        # 限流检查
-        if not self._can_write():
-            return False
-        
-        try:
-            event_name = event_data.get("question", "未知事件")
-            if trade_signal:
-                self.log_trade_signal(event_name, trade_signal)
-            timestamp_utc = datetime.now(timezone.utc).isoformat()
+        async with self.notion_lock:
+            # 限流检查
+            if not self._can_write():
+                return False
             
-            # 检查重复记录（简化检查，避免因属性不存在而失败）
-            existing_page_id = self._check_duplicate(event_name, timestamp_utc)
-            
-            if outcomes and len(outcomes) > 0:
-                # 多选项事件：为每个选项创建一条记录
-                success_count = 0
+            try:
+                event_name = event_data.get("question", "未知事件")
+                if trade_signal:
+                    self.log_trade_signal(event_name, trade_signal)
+                timestamp_utc = datetime.now(timezone.utc).isoformat()
                 
-                # 计算 AI 预测总和
-                ai_sum = None
-                if normalization_info:
-                    ai_sum = normalization_info.get("total_after", 0)
-                else:
-                    # 手动计算
-                    ai_sum = sum(
-                        outcome.get("model_only_prob") or outcome.get("prediction", 0) or 0
-                        for outcome in outcomes
-                        if outcome.get("model_only_prob") is not None or outcome.get("prediction") is not None
-                    )
+                # 检查重复记录（简化检查，避免因属性不存在而失败）
+                existing_page_id = self._check_duplicate(event_name, timestamp_utc)
                 
-                for outcome in outcomes:
-                    properties = self._create_page_properties(
-                        event_data=event_data,
-                        fusion_result=fusion_result,
-                        outcome=outcome,
-                        full_analysis=full_analysis,
-                        normalization_info=normalization_info,
-                        ai_sum=ai_sum,
-                        trade_signal=trade_signal
-                    )
+                if outcomes and len(outcomes) > 0:
+                    # 多选项事件：为每个选项创建一条记录
+                    success_count = 0
                     
-                    # 检查是否重复（基于事件名称、选项名称和时间戳）
-                    if existing_page_id:
-                        # 更新现有页面
-                        try:
-                            self.client.pages.update(
-                                page_id=existing_page_id,
-                                properties=properties
-                            )
-                            print(f"✅ Notion Logger: 更新记录 - {event_name[:50]}... ({outcome.get('name', 'N/A')})")
-                        except Exception as e:
-                            print(f"⚠️ Notion Logger: 更新记录失败: {e}")
-                            # 如果更新失败，尝试创建新记录
+                    # 计算 AI 预测总和
+                    ai_sum = None
+                    if normalization_info:
+                        ai_sum = normalization_info.get("total_after", 0)
+                    else:
+                        # 手动计算
+                        ai_sum = sum(
+                            outcome.get("model_only_prob") or outcome.get("prediction", 0) or 0
+                            for outcome in outcomes
+                            if outcome.get("model_only_prob") is not None or outcome.get("prediction") is not None
+                        )
+                    
+                    for outcome in outcomes:
+                        properties = self._create_page_properties(
+                            event_data=event_data,
+                            fusion_result=fusion_result,
+                            outcome=outcome,
+                            full_analysis=full_analysis,
+                            normalization_info=normalization_info,
+                            ai_sum=ai_sum,
+                            trade_signal=trade_signal
+                        )
+                        
+                        # 检查是否重复（基于事件名称、选项名称和时间戳）
+                        if existing_page_id:
+                            # 更新现有页面
+                            try:
+                                self.client.pages.update(
+                                    page_id=existing_page_id,
+                                    properties=properties
+                                )
+                                print(f"✅ Notion Logger: 更新记录 - {event_name[:50]}... ({outcome.get('name', 'N/A')})")
+                            except Exception as e:
+                                print(f"⚠️ Notion Logger: 更新记录失败: {e}")
+                                # 如果更新失败，尝试创建新记录
+                                try:
+                                    self.client.pages.create(
+                                        parent={"database_id": self.database_id},
+                                        properties=properties
+                                    )
+                                    print(f"✅ Notion Logger: 创建记录 - {event_name[:50]}... ({outcome.get('name', 'N/A')})")
+                                    success_count += 1
+                                except Exception as e2:
+                                    print(f"❌ Notion Logger: 创建记录失败: {e2}")
+                        else:
+                            # 创建新页面
                             try:
                                 self.client.pages.create(
                                     parent={"database_id": self.database_id},
@@ -432,8 +446,65 @@ class NotionLogger:
                                 )
                                 print(f"✅ Notion Logger: 创建记录 - {event_name[:50]}... ({outcome.get('name', 'N/A')})")
                                 success_count += 1
-                            except Exception as e2:
-                                print(f"❌ Notion Logger: 创建记录失败: {e2}")
+                            except Exception as e:
+                                print(f"❌ Notion Logger: 创建记录失败: {e}")
+                                # 尝试只写入标题（最基本的信息）
+                                try:
+                                    minimal_props = {
+                                        "Event Name": properties.get("Event Name", {
+                                            "title": [{"text": {"content": event_name[:2000]}}]
+                                        })
+                                    }
+                                    page_content = f"选项: {outcome.get('name', 'N/A')}\nAI预测: {outcome.get('prediction', 'N/A')}%\n市场预测: {outcome.get('market_prob', 'N/A')}%\n摘要: {outcome.get('summary', 'N/A')[:500]}"
+                                    self.client.pages.create(
+                                        parent={"database_id": self.database_id},
+                                        properties=minimal_props,
+                                        children=[{
+                                            "object": "block",
+                                            "type": "paragraph",
+                                            "paragraph": {
+                                                "rich_text": [{
+                                                    "type": "text",
+                                                    "text": {"content": page_content}
+                                                }]
+                                            }
+                                        }]
+                                    )
+                                    print(f"✅ Notion Logger: 创建最小记录 - {event_name[:50]}...")
+                                    success_count += 1
+                                except Exception as e2:
+                                    print(f"❌ Notion Logger: 创建最小记录也失败: {e2}")
+                    
+                    # 更新写入时间
+                    if success_count > 0:
+                        self.last_write_time = time.time()
+                    
+                    return success_count > 0
+                else:
+                    # 单选项事件：创建一条记录
+                    properties = self._create_page_properties(
+                        event_data=event_data,
+                        fusion_result=fusion_result,
+                        outcome=None,
+                        full_analysis=full_analysis,
+                        normalization_info=normalization_info,
+                        ai_sum=None,
+                        trade_signal=trade_signal
+                    )
+                    
+                    if existing_page_id:
+                        # 更新现有页面
+                        try:
+                            self.client.pages.update(
+                                page_id=existing_page_id,
+                                properties=properties
+                            )
+                            print(f"✅ Notion Logger: 更新记录 - {event_name[:50]}...")
+                            self.last_write_time = time.time()
+                            return True
+                        except Exception as e:
+                            print(f"⚠️ Notion Logger: 更新记录失败: {e}")
+                            return False
                     else:
                         # 创建新页面
                         try:
@@ -441,8 +512,9 @@ class NotionLogger:
                                 parent={"database_id": self.database_id},
                                 properties=properties
                             )
-                            print(f"✅ Notion Logger: 创建记录 - {event_name[:50]}... ({outcome.get('name', 'N/A')})")
-                            success_count += 1
+                            print(f"✅ Notion Logger: 创建记录 - {event_name[:50]}...")
+                            self.last_write_time = time.time()
+                            return True
                         except Exception as e:
                             print(f"❌ Notion Logger: 创建记录失败: {e}")
                             # 尝试只写入标题（最基本的信息）
@@ -452,7 +524,7 @@ class NotionLogger:
                                         "title": [{"text": {"content": event_name[:2000]}}]
                                     })
                                 }
-                                page_content = f"选项: {outcome.get('name', 'N/A')}\nAI预测: {outcome.get('prediction', 'N/A')}%\n市场预测: {outcome.get('market_prob', 'N/A')}%\n摘要: {outcome.get('summary', 'N/A')[:500]}"
+                                page_content = f"AI预测: {fusion_result.get('final_prob', 'N/A')}%\n市场预测: {event_data.get('market_prob', 'N/A')}%\n摘要: {fusion_result.get('summary', 'N/A')[:500]}"
                                 self.client.pages.create(
                                     parent={"database_id": self.database_id},
                                     properties=minimal_props,
@@ -468,97 +540,28 @@ class NotionLogger:
                                     }]
                                 )
                                 print(f"✅ Notion Logger: 创建最小记录 - {event_name[:50]}...")
-                                success_count += 1
+                                self.last_write_time = time.time()
+                                return True
                             except Exception as e2:
                                 print(f"❌ Notion Logger: 创建最小记录也失败: {e2}")
-                
-                # 更新写入时间
-                if success_count > 0:
-                    self.last_write_time = time.time()
-                
-                return success_count > 0
-            else:
-                # 单选项事件：创建一条记录
-                properties = self._create_page_properties(
-                    event_data=event_data,
-                    fusion_result=fusion_result,
-                    outcome=None,
-                    full_analysis=full_analysis,
-                    normalization_info=normalization_info,
-                    ai_sum=None,
-                    trade_signal=trade_signal
-                )
-                
-                if existing_page_id:
-                    # 更新现有页面
-                    try:
-                        self.client.pages.update(
-                            page_id=existing_page_id,
-                            properties=properties
-                        )
-                        print(f"✅ Notion Logger: 更新记录 - {event_name[:50]}...")
-                        self.last_write_time = time.time()
-                        return True
-                    except Exception as e:
-                        print(f"⚠️ Notion Logger: 更新记录失败: {e}")
-                        return False
-                else:
-                    # 创建新页面
-                    try:
-                        self.client.pages.create(
-                            parent={"database_id": self.database_id},
-                            properties=properties
-                        )
-                        print(f"✅ Notion Logger: 创建记录 - {event_name[:50]}...")
-                        self.last_write_time = time.time()
-                        return True
-                    except Exception as e:
-                        print(f"❌ Notion Logger: 创建记录失败: {e}")
-                        # 尝试只写入标题（最基本的信息）
-                        try:
-                            minimal_props = {
-                                "Event Name": properties.get("Event Name", {
-                                    "title": [{"text": {"content": event_name[:2000]}}]
-                                })
-                            }
-                            page_content = f"AI预测: {fusion_result.get('final_prob', 'N/A')}%\n市场预测: {event_data.get('market_prob', 'N/A')}%\n摘要: {fusion_result.get('summary', 'N/A')[:500]}"
-                            self.client.pages.create(
-                                parent={"database_id": self.database_id},
-                                properties=minimal_props,
-                                children=[{
-                                    "object": "block",
-                                    "type": "paragraph",
-                                    "paragraph": {
-                                        "rich_text": [{
-                                            "type": "text",
-                                            "text": {"content": page_content}
-                                        }]
-                                    }
-                                }]
-                            )
-                            print(f"✅ Notion Logger: 创建最小记录 - {event_name[:50]}...")
-                            self.last_write_time = time.time()
-                            return True
-                        except Exception as e2:
-                            print(f"❌ Notion Logger: 创建最小记录也失败: {e2}")
-                            return False
-        
-        except Exception as e:
-            error_type = type(e).__name__
-            error_msg = str(e)
-            print(f"❌ Notion Logger: 记录预测结果时出错: {error_type}: {error_msg}")
-            import traceback
-            traceback.print_exc()
+                                return False
             
-            # 提供更详细的错误诊断
-            error_lower = error_msg.lower()
-            if "unauthorized" in error_lower or "401" in error_msg:
-                print("   💡 可能原因: NOTION_TOKEN 无效或已过期")
-            elif "not found" in error_lower or "404" in error_msg:
-                print("   💡 可能原因: NOTION_DB_ID 不正确，或 Integration 没有数据库访问权限")
-            elif "rate limit" in error_lower or "429" in error_msg:
-                print("   💡 可能原因: Notion API 限流，请稍后重试")
-            elif "forbidden" in error_lower or "403" in error_msg:
-                print("   💡 可能原因: Integration 没有写入权限，请在 Notion 中授予权限")
-            
-            return False
+            except Exception as e:
+                error_type = type(e).__name__
+                error_msg = str(e)
+                print(f"❌ Notion Logger: 记录预测结果时出错: {error_type}: {error_msg}")
+                import traceback
+                traceback.print_exc()
+                
+                # 提供更详细的错误诊断
+                error_lower = error_msg.lower()
+                if "unauthorized" in error_lower or "401" in error_msg:
+                    print("   💡 可能原因: NOTION_TOKEN 无效或已过期")
+                elif "not found" in error_lower or "404" in error_msg:
+                    print("   💡 可能原因: NOTION_DB_ID 不正确，或 Integration 没有数据库访问权限")
+                elif "rate limit" in error_lower or "429" in error_msg:
+                    print("   💡 可能原因: Notion API 限流，请稍后重试")
+                elif "forbidden" in error_lower or "403" in error_msg:
+                    print("   💡 可能原因: Integration 没有写入权限，请在 Notion 中授予权限")
+                
+                return False

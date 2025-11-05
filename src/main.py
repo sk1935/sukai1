@@ -19,6 +19,7 @@ import signal
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, Dict, List, Optional, Tuple
 
 TELEGRAM_AVAILABLE = True
 TELEGRAM_BACKEND = "application"
@@ -242,18 +243,21 @@ class ForecastingBot:
             traceback.print_exc()
             self.notion_logger = None
     
-    async def handle_predict(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /predict command."""
+    async def _prepare_prediction_context(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE
+    ) -> Optional[str]:
+        """Validate update, show typing indicator, and preload news cache."""
         if not update.message:
             print("⚠️ handle_predict: No message in update")
-            return
-        
+            return None
+
         message_text = update.message.text or ""
         print(f"\n{'='*60}")
         print(f"📨 收到消息: {message_text[:100]}...")
         print(f"{'='*60}")
-        
-        # Show typing indicator
+
         try:
             await maybe_await(context.bot.send_chat_action(
                 chat_id=update.effective_chat.id,
@@ -261,9 +265,7 @@ class ForecastingBot:
             ))
         except Exception as e:
             print(f"⚠️ 发送typing indicator失败: {e}")
-        
-        # 【集成】预加载新闻缓存（如果启用，同步等待以确保数据可用）
-        # 【稳定性保护】添加完整的异常处理和日志
+
         try:
             from src.news_cache import fetch_and_cache_news, NEWS_CACHE_ENABLED
             if NEWS_CACHE_ENABLED:
@@ -271,7 +273,7 @@ class ForecastingBot:
                 try:
                     await asyncio.wait_for(
                         fetch_and_cache_news(keyword="", force_refresh=False),
-                        timeout=15.0  # 最多等待15秒
+                        timeout=15.0
                     )
                     print("✅ [NEWS_CACHE] 新闻缓存预加载完成")
                 except asyncio.TimeoutError:
@@ -284,7 +286,768 @@ class ForecastingBot:
             print(f"⚠️ [NEWS_CACHE] 模块导入失败: {e}")
         except Exception as e:
             print(f"⚠️ [NEWS_CACHE] 预加载异常: {type(e).__name__}: {e}")
-        
+
+        return message_text
+
+    async def _fetch_event_data(
+        self,
+        update: Update,
+        event_info: Dict[str, str]
+    ) -> Dict:
+        """Fetch Polymarket data with timeout and mock fallbacks."""
+        await maybe_await(update.message.reply_text("🔍 正在获取市场数据..."))
+        print(f"🔍 开始获取市场数据，event_info: {event_info}")
+        event_data: Optional[Dict] = None
+        try:
+            event_data = await asyncio.wait_for(
+                self.event_manager.fetch_polymarket_data(event_info),
+                timeout=25.0
+            )
+            if event_data:
+                print("✅ 成功获取市场数据:")
+                print(f"  question: {event_data.get('question', 'N/A')[:80]}")
+                print(f"  market_prob: {event_data.get('market_prob', 'N/A')}")
+                print(f"  is_mock: {event_data.get('is_mock', False)}")
+            else:
+                print("⚠️ event_data 为 None")
+        except asyncio.TimeoutError:
+            print("⏱️ 获取市场数据超时")
+            await maybe_await(update.message.reply_text(
+                "⏱️ 获取市场数据超时，将使用 AI 模型进行预测。",
+                parse_mode="Markdown"
+            ))
+            event_data = self.event_manager._create_mock_market_data(event_info.get('query', ''))
+            event_data["is_mock"] = True
+            return event_data
+        except Exception as exc:
+            print(f"⚠️ 获取市场数据异常: {type(exc).__name__}: {exc}")
+
+        if not event_data:
+            print("❌ 未能获取市场数据，创建mock数据")
+            await maybe_await(update.message.reply_text(
+                self.output_formatter.format_error(
+                    "获取市场数据失败，将使用 AI 模型进行预测。"
+                ),
+                parse_mode="Markdown"
+            ))
+            event_data = self.event_manager._create_mock_market_data(event_info.get('query', ''))
+            event_data["is_mock"] = True
+
+        return event_data
+
+    async def _analyze_event(
+        self,
+        event_data: Dict,
+        event_info: Dict[str, str]
+    ) -> Tuple[Dict, Dict, Optional[str], List[str]]:
+        """Run full event analysis, news summary, and model selection."""
+        market_slug = event_info.get('slug')
+        try:
+            full_analysis = await asyncio.wait_for(
+                self.event_analyzer.analyze_event_full(
+                    event_title=event_data.get("question", ""),
+                    event_rules=event_data.get("rules", ""),
+                    market_prob=event_data.get("market_prob"),
+                    market_slug=market_slug
+                ),
+                timeout=15.0
+            )
+            print("✅ 完整事件分析完成（包含市场趋势、舆情、规则摘要）")
+        except asyncio.TimeoutError:
+            print("⏱️ [WARNING] 事件分析超时，使用默认值")
+            full_analysis = {
+                "event_category": "general",
+                "event_category_display": "通用",
+                "market_trend": "数据不足",
+                "sentiment_trend": "unknown",
+                "sentiment_score": 0.0,
+                "sentiment_sample": 0,
+                "sentiment_source": "未知",
+                "rules_summary": event_data.get("rules", "")[:100] if event_data.get("rules") else "无规则信息"
+            }
+        except Exception as e:
+            print(f"⚠️ 完整事件分析失败: {type(e).__name__}: {e}，使用基础分析")
+            full_analysis = {
+                "event_category": event_data.get("category", "unknown"),
+                "event_category_display": event_data.get("category", "unknown"),
+                "market_trend": "分析失败",
+                "sentiment_trend": "unknown",
+                "sentiment_score": 0.0,
+                "sentiment_sample": 0,
+                "sentiment_source": "未知",
+                "rules_summary": event_data.get("rules", "")[:100] if event_data.get("rules") else "无规则信息"
+            }
+
+        print("
+📊 事件全面分析:")
+        print(f"  类别: {full_analysis['event_category']} ({full_analysis.get('event_category_display', '未知')})")
+        print(f"  市场趋势: {full_analysis['market_trend']}")
+        sentiment_score = full_analysis.get('sentiment_score') or 0.0
+        print(
+            f"  舆情: {full_analysis.get('sentiment_trend', 'unknown')} ({sentiment_score:+.2f}), "
+            f"样本: {full_analysis.get('sentiment_sample', 0)} ({full_analysis.get('sentiment_source', '未知')})"
+        )
+        print(f"  规则摘要: {full_analysis.get('rules_summary', '')[:60]}...")
+        world_temp_data = full_analysis.get("world_temp_data")
+        if world_temp_data:
+            description = world_temp_data.get("description", "未知")
+            positive = world_temp_data.get("positive", 0)
+            negative = world_temp_data.get("negative", 0)
+            neutral = world_temp_data.get("neutral", 0)
+            print(f"  🧠 世界情绪: {description}（正面: {positive}, 负面: {negative}, 中性: {neutral}）")
+        elif full_analysis.get("world_sentiment_summary"):
+            print(f"  🧠 世界情绪: {full_analysis['world_sentiment_summary'][:80]}...")
+
+        news_summary = None
+        try:
+            from src.openrouter_assistant import get_news_summary, OPENROUTER_ASSISTANT_ENABLED
+            if OPENROUTER_ASSISTANT_ENABLED:
+                news_summary = await asyncio.wait_for(
+                    get_news_summary(),
+                    timeout=10.0
+                )
+                if news_summary:
+                    print(f"  📰 新闻摘要: 已获取（{len(news_summary)} 字符）")
+            else:
+                print("  ℹ️ [OPENROUTER] 功能未启用，跳过新闻摘要")
+        except asyncio.TimeoutError:
+            print("  ⏱️ [OPENROUTER] 获取新闻摘要超时（>10s），跳过")
+        except ImportError as e:
+            print(f"  ⚠️ [OPENROUTER] 模块导入失败: {e}")
+        except Exception as e:
+            print(f"  ⚠️ [OPENROUTER] 获取新闻摘要失败: {type(e).__name__}: {e}")
+
+        event_analysis = self.event_analyzer.analyze_event(
+            event_data.get("question", ""),
+            event_data.get("rules", ""),
+            available_models=None,
+            orchestrator=self.model_orchestrator
+        )
+        print(f"
+📊 Event Category: {event_analysis['category']}")
+        print(f"📐 Dimensions: {len(event_analysis['dimensions'])}")
+        model_names = [
+            model for model in event_analysis["model_assignments"].keys()
+            if model in self.model_orchestrator.get_available_models()
+        ]
+        event_data["full_analysis"] = full_analysis
+        event_data["world_temp"] = full_analysis.get("world_temp")
+        event_data["world_temp_data"] = full_analysis.get("world_temp_data")
+        event_data["world_sentiment_summary"] = full_analysis.get("world_sentiment_summary")
+        event_data["news_summary"] = news_summary
+        return event_analysis, full_analysis, news_summary, model_names
+
+    def _build_binary_prompts(
+        self,
+        event_data: Dict,
+        model_assignments: Dict,
+        model_names: List[str]
+    ) -> Dict[str, str]:
+        """Construct per-model prompts for binary predictions."""
+        prompts: Dict[str, str] = {}
+        for model_name in model_names:
+            assignment = model_assignments.get(model_name)
+            prompt = self.prompt_builder.build_prompt(
+                event_data,
+                model_name,
+                model_assignment=assignment
+            )
+            prompts[model_name] = prompt
+            if assignment:
+                print(f"  ✅ {model_name}: {assignment['dimension_name']}")
+        return prompts
+
+    async def _call_binary_models(
+        self,
+        update: Update,
+        prompts: Dict[str, str]
+    ) -> Optional[Dict[str, Optional[Dict[str, Any]]]]:
+        """Call orchestrator models (plus OpenRouter) with shared timeout and fallbacks."""
+        await maybe_await(update.message.reply_text("🤖 正在查询 AI 模型..."))
+        print(f"\n📞 Calling {len(prompts)} models: {list(prompts.keys())}")
+
+        try:
+            timeout = self.model_orchestrator.MAX_TOTAL_WAIT_TIME
+            model_results = await asyncio.wait_for(
+                self.model_orchestrator.call_all_models(prompts),
+                timeout=float(timeout)
+            )
+
+            success_count = sum(1 for r in model_results.values() if r is not None)
+
+            if OPENROUTER_INTEGRATION_AVAILABLE and is_openrouter_available():
+                print(f"\n🆓 [OpenRouter] 调用免费模型作为辅助层...")
+                openrouter_models = get_openrouter_models()
+                selected_models = openrouter_models[:2] if len(openrouter_models) >= 2 else openrouter_models
+
+                if selected_models:
+                    common_prompt = list(prompts.values())[0] if prompts else ""
+
+                    try:
+                        openrouter_results = await asyncio.wait_for(
+                            call_multiple_openrouter_models(selected_models, common_prompt),
+                            timeout=30.0
+                        )
+
+                        openrouter_success = 0
+                        for model_name, result in openrouter_results.items():
+                            if result:
+                                display_name = model_name.split('/')[-1]
+                                model_results[f"openrouter_{display_name}"] = result
+                                openrouter_success += 1
+
+                        if openrouter_success > 0:
+                            print(f"✅ [OpenRouter] {openrouter_success}/{len(selected_models)} 个模型调用成功")
+                            success_count += openrouter_success
+                        else:
+                            print("⚠️ [OpenRouter] 所有模型调用失败")
+
+                    except asyncio.TimeoutError:
+                        print("⏱️ [OpenRouter] 调用超时，跳过")
+                    except Exception as e:
+                        print(f"⚠️ [OpenRouter] 调用异常: {type(e).__name__}: {e}")
+            else:
+                print("ℹ️ [OpenRouter] API 密钥未配置，跳过免费模型调用")
+
+            if success_count == 0:
+                print("⚠️ [WARNING] 所有模型调用失败，使用市场价格作为fallback")
+                await maybe_await(update.message.reply_text(
+                    "⚠️ AI模型暂时无响应，将使用市场价格进行预测。",
+                    parse_mode="Markdown"
+                ))
+            elif success_count < len(prompts):
+                print(f"⚠️ [WARNING] 部分模块响应慢：{success_count}/{len(prompts)} 个模型成功")
+
+            return model_results
+
+        except asyncio.TimeoutError:
+            timeout = self.model_orchestrator.MAX_TOTAL_WAIT_TIME
+            print(f"⏱️ [ERROR] 模型查询总超时（>{timeout}s）")
+            import traceback
+            print("[DEBUG] Timeout exception traceback:")
+            traceback.print_exc()
+
+            try:
+                model_results = {
+                    name: {
+                        "probability": 50.0,
+                        "confidence": "low",
+                        "reasoning": "Overall timeout"
+                    }
+                    for name in prompts.keys()
+                }
+                await maybe_await(update.message.reply_text(
+                    "⚠️ 部分模块响应延迟，结果可能不完全准确。",
+                    parse_mode="Markdown"
+                ))
+                return model_results
+            except Exception as e:
+                print(f"❌ [ERROR] 处理超时异常失败: {type(e).__name__}: {e}")
+                import traceback
+                traceback.print_exc()
+                await maybe_await(update.message.reply_text(
+                    "⏱️ 模型查询超时，请稍后重试。",
+                    parse_mode="Markdown"
+                ))
+                return None
+
+    async def _finalize_binary_prediction(
+        self,
+        update: Update,
+        event_data: Dict,
+        model_results: Dict[str, Optional[Dict[str, Any]]],
+        model_names: List[str],
+        full_analysis: Dict
+    ) -> None:
+        """Fuse model outputs, compute trade signal, format output, and log to Notion."""
+        print(f"\n📊 Model Results:")
+        for model_name, result in model_results.items():
+            if result:
+                print(f"  ✅ {model_name}: {result.get('probability')}% ({result.get('confidence')})")
+            else:
+                print(f"  ❌ {model_name}: No response")
+
+        model_weights = {
+            model_name: self.model_orchestrator.get_model_weight(model_name)
+            for model_name in model_names
+        }
+
+        if OPENROUTER_INTEGRATION_AVAILABLE and is_openrouter_available():
+            openrouter_models = get_openrouter_models()
+            for model_name in openrouter_models[:2]:
+                display_name = model_name.split('/')[-1]
+                openrouter_key = f"openrouter_{display_name}"
+                if openrouter_key in model_results and model_results[openrouter_key]:
+                    model_weights[openrouter_key] = 0.5
+
+        fusion_result = self.fusion_engine.fuse_predictions(
+            model_results=model_results,
+            model_weights=model_weights,
+            market_prob=event_data["market_prob"],
+            orchestrator=self.model_orchestrator
+        )
+
+        trade_signal_data = None
+        if fusion_result:
+            ai_prob_trade = fusion_result.get("model_only_prob")
+            if ai_prob_trade is None:
+                ai_prob_trade = fusion_result.get("final_prob")
+            market_prob_trade = event_data.get("market_prob")
+            market_prob_trade = (
+                market_prob_trade if market_prob_trade is not None else fusion_result.get("final_prob")
+            )
+            days_to_resolution = event_data.get("days_left") or 30
+            uncertainty_ratio = (fusion_result.get("uncertainty") or 0.0) / 100.0
+            trade_signal_data = self.fusion_engine.evaluate_trade_signal(
+                ai_prob_trade,
+                market_prob_trade,
+                days_to_resolution,
+                uncertainty_ratio
+            )
+            print(
+                f"[TRADE_SIGNAL] computed event={event_data.get('question', 'N/A')} "
+                f"signal={trade_signal_data.get('signal')} ev={trade_signal_data.get('ev')}"
+            )
+            fusion_result["trade_signal"] = trade_signal_data
+            fusion_result["ev"] = trade_signal_data.get("ev")
+            fusion_result["annualized_ev"] = trade_signal_data.get("annualized_ev")
+            fusion_result["risk_factor"] = trade_signal_data.get("risk_factor")
+            fusion_result["signal"] = trade_signal_data.get("signal")
+            fusion_result["signal_reason"] = trade_signal_data.get("signal_reason")
+
+        output = self.output_formatter.format_prediction(
+            event_data=event_data,
+            fusion_result=fusion_result,
+            trade_signal=trade_signal_data
+        )
+
+        await maybe_await(update.message.reply_text(
+            output,
+            parse_mode="Markdown"
+        ))
+
+        if self.notion_logger:
+            if not self.notion_logger.enabled:
+                print("⚠️ Notion Logger 未启用，跳过记录（单选项事件）")
+        if self.notion_logger and self.notion_logger.enabled:
+            try:
+                event_data_for_notion = event_data.copy()
+                if full_analysis:
+                    event_data_for_notion["category"] = full_analysis.get(
+                        "event_category_display",
+                        full_analysis.get("event_category", "-")
+                    )
+                if "outcomes" not in event_data_for_notion:
+                    event_data_for_notion["outcomes"] = ["Yes"]
+
+                fusion_result_for_notion = fusion_result.copy()
+                if "models" not in fusion_result_for_notion:
+                    model_versions = fusion_result.get("model_versions", {})
+                    if model_versions:
+                        fusion_result_for_notion["models"] = [
+                            info.get("display_name", model_id)
+                            for model_id, info in model_versions.items()
+                        ]
+                    else:
+                        fusion_result_for_notion["models"] = model_names
+                if "run_id" not in fusion_result_for_notion:
+                    import uuid
+                    fusion_result_for_notion["run_id"] = str(uuid.uuid4())
+
+                self.notion_logger.log_prediction(
+                    event_data=event_data_for_notion,
+                    fusion_result=fusion_result_for_notion,
+                    full_analysis=full_analysis,
+                    outcomes=None,
+                    normalization_info=None,
+                    trade_signal=None
+                )
+            except Exception as e:
+                print(f"⚠️ Notion Logger 记录失败: {e}")
+
+    def _gather_multi_option_prompts(
+        self,
+        event_data: Dict,
+        model_assignments: Dict,
+        model_names: List[str],
+        outcome: Dict
+    ) -> Dict[str, str]:
+        """Build prompts for a single multi-option outcome."""
+        outcome_name = outcome.get("name", "未知选项")
+        print(f"[MULTI_FLOW] Building prompts for outcome: {outcome_name}")
+        prompts: Dict[str, str] = {}
+        for model_name in model_names:
+            assignment = model_assignments.get(model_name)
+            option_event_data = event_data.copy()
+            option_event_data["question"] = f"{event_data.get('question', '')} - {outcome_name}"
+            option_event_data["market_prob"] = outcome.get("market_prob")
+            prompt = self.prompt_builder.build_prompt(
+                option_event_data,
+                model_name,
+                model_assignment=assignment
+            )
+            prompts[model_name] = prompt
+            if assignment:
+                print(f"   - {model_name}: {assignment['dimension_name']}")
+        if not prompts:
+            print(f"[MULTI_FLOW] No prompts constructed for {outcome_name}")
+        return prompts
+
+    async def _run_multi_option_models(
+        self,
+        outcome_name: str,
+        prompts: Dict[str, str]
+    ) -> Dict[str, Optional[Dict[str, Any]]]:
+        """Call models (with retries + OpenRouter) for a single outcome."""
+        if not prompts:
+            return {}
+
+        print(f"[MULTI_FLOW] Running models for outcome: {outcome_name} ({len(prompts)} prompts)")
+        max_retries = 2
+        timeout = min(
+            self.model_orchestrator.MAX_TOTAL_WAIT_TIME,
+            30.0
+        )
+        model_results: Dict[str, Optional[Dict[str, Any]]] = {}
+
+        for retry in range(max_retries):
+            try:
+                print(f"📤 调用 {len(prompts)} 个模型（尝试 {retry + 1}/{max_retries}）")
+                model_results = await asyncio.wait_for(
+                    self.model_orchestrator.call_all_models(prompts),
+                    timeout=timeout
+                )
+                success_count = sum(1 for r in model_results.values() if r)
+                if success_count > 0:
+                    break
+                if retry < max_retries - 1 and success_count == 0:
+                    print(f"  ⚠️ {outcome_name} 首次调用无结果，等待 1 秒后重试...")
+                    await asyncio.sleep(1)
+                    continue
+            except asyncio.TimeoutError:
+                if retry < max_retries - 1:
+                    print(f"  ⏱️ {outcome_name} 超时（>{timeout}s），重试 {retry + 1}/{max_retries}...")
+                    await asyncio.sleep(1)
+                    continue
+                print(f"  ⏱️ [ERROR] {outcome_name} 重试后仍超时（>{timeout}s），使用市场价格")
+                model_results = {}
+                break
+            except Exception as e:
+                if retry < max_retries - 1:
+                    print(f"  ⚠️ {outcome_name} 调用异常 ({type(e).__name__})，重试 {retry + 1}/{max_retries}...")
+                    await asyncio.sleep(1)
+                    continue
+                print(f"  ❌ [ERROR] {outcome_name} 重试后仍异常: {type(e).__name__}: {e}")
+                model_results = {}
+                break
+
+        if OPENROUTER_INTEGRATION_AVAILABLE and is_openrouter_available():
+            openrouter_models = get_openrouter_models()
+            if openrouter_models:
+                selected_model = openrouter_models[0]
+                option_prompt = list(prompts.values())[0] if prompts else ""
+                try:
+                    openrouter_result = await asyncio.wait_for(
+                        call_openrouter_model(selected_model, option_prompt),
+                        timeout=25.0
+                    )
+                    if openrouter_result:
+                        display_name = selected_model.split('/')[-1]
+                        model_results[f"openrouter_{display_name}"] = openrouter_result
+                        print(f"✅ [OpenRouter] {display_name} 调用成功（{outcome_name}）")
+                except Exception as e:
+                    print(f"⚠️ [OpenRouter] {outcome_name} 调用异常: {type(e).__name__}")
+
+        success_count = sum(1 for r in model_results.values() if r)
+        expected_count = len(prompts) + (
+            1 if OPENROUTER_INTEGRATION_AVAILABLE and is_openrouter_available() and get_openrouter_models() else 0
+        )
+        print(f"📥 {outcome_name} 收到 {success_count}/{expected_count} 个模型响应")
+        if success_count == 0:
+            print(f"  ⚠️ [WARNING] {outcome_name} 所有模型调用失败，将使用市场价格")
+            print(f"  [DEBUG] 模型结果详情: {model_results}")
+            print(f"  [DEBUG] 是否有结果: {bool(model_results)}, 结果数量: {len(model_results)}")
+        else:
+            print(f"  ✅ {outcome_name} 成功获得 {success_count} 个模型响应")
+
+        return model_results
+
+    def _fuse_multi_option_outcome(
+        self,
+        outcome: Dict,
+        outcome_results: Dict[str, Optional[Dict[str, Any]]],
+        model_weights: Dict[str, float],
+        current_reasoning: Optional[str]
+    ) -> Tuple[Dict[str, Any], Optional[str]]:
+        """Fuse predictions (or fallback) for a single outcome."""
+        outcome_name = outcome.get("name", "未知选项")
+        print(f"[MULTI_FLOW] Fusing outcome: {outcome_name}")
+        valid_count = sum(1 for r in outcome_results.values() if r is not None)
+
+        if valid_count > 0:
+            fusion_result = self.fusion_engine.fuse_predictions(
+                model_results=outcome_results,
+                model_weights=model_weights,
+                market_prob=outcome["market_prob"],
+                orchestrator=self.model_orchestrator
+            )
+            if not current_reasoning and fusion_result.get("deepseek_reasoning"):
+                current_reasoning = fusion_result.get("deepseek_reasoning")
+
+            final_prob = fusion_result.get("final_prob") or 0.0
+            if final_prob is None:
+                print(f"⚠️ final_prob is None for {outcome_name}, using default 0.0")
+                final_prob = 0.0
+
+            model_only_prob_value = fusion_result.get("model_only_prob")
+            if model_only_prob_value is None:
+                model_only_prob_display = "N/A"
+            else:
+                model_only_prob_value = model_only_prob_value or 0.0
+                if model_only_prob_value is None:
+                    print("⚙️ [SAFE] 修复空值保护: model_only_prob_display")
+                    model_only_prob_value = 0.0
+                model_only_prob_display = f"{(model_only_prob_value or 0.0):.1f}%"
+
+            print(f"  ✅ 融合完成: {outcome_name} = {(final_prob or 0.0):.1f}% (AI: {model_only_prob_display})")
+
+            fused_outcome = {
+                "name": outcome_name,
+                "prediction": fusion_result["final_prob"],
+                "market_prob": outcome["market_prob"],
+                "uncertainty": fusion_result["uncertainty"],
+                "summary": fusion_result["summary"],
+                "model_only_prob": fusion_result.get("model_only_prob"),
+                "model_versions": fusion_result.get("model_versions", {}),
+                "weight_source": fusion_result.get("weight_source", {}),
+                "deepseek_reasoning": fusion_result.get("deepseek_reasoning")
+            }
+            return fused_outcome, current_reasoning
+
+        if not outcome_results:
+            reason = "无模型结果"
+        elif valid_count == 0:
+            reason = "所有模型调用失败/超时"
+        else:
+            reason = "无有效模型结果"
+
+        market_prob = outcome.get("market_prob") or 0.0
+        if market_prob is None:
+            print(f"⚠️ market_prob is None for {outcome_name}, using default 0.0")
+            market_prob = 0.0
+        print(f"  ⚠️ 无AI预测: {outcome_name}（{reason}，有效结果数: {valid_count}），使用市场价格 {(market_prob or 0.0):.1f}%")
+
+        fused_outcome = {
+            "name": outcome_name,
+            "prediction": outcome["market_prob"],
+            "market_prob": outcome["market_prob"],
+            "uncertainty": 10.0,
+            "summary": f"⚠️ {reason}，暂无 AI 模型预测，显示市场价格",
+            "model_only_prob": None
+        }
+        return fused_outcome, current_reasoning
+
+    async def _finalize_multi_option_response(
+        self,
+        update: Update,
+        event_data: Dict,
+        fused_outcomes: List[Dict[str, Any]],
+        raw_outcomes: List[Dict[str, Any]],
+        full_analysis: Dict,
+        deepseek_reasoning: Optional[str],
+        model_names: List[str]
+    ) -> None:
+        """Normalize, format, and log multi-option predictions."""
+        print("[MULTI_FLOW] Finalizing multi-option response")
+        if not fused_outcomes and raw_outcomes:
+            print(f"⚠️ fused_outcomes 为空，从原始 outcomes 创建 fallback 数据...")
+            fused_outcomes.extend([{
+                "name": outcome["name"],
+                "prediction": outcome["market_prob"],
+                "market_prob": outcome["market_prob"],
+                "uncertainty": 10.0,
+                "summary": "暂无 AI 模型预测，显示市场价格。",
+                "model_only_prob": None
+            } for outcome in raw_outcomes])
+            print(f"✅ 创建了 {len(fused_outcomes)} 个 fallback outcomes")
+        elif not fused_outcomes:
+            print("❌ 严重错误：既没有 fused_outcomes 也没有 outcomes！")
+
+        print(f"📊 归一化前 fused_outcomes 数量: {len(fused_outcomes)}")
+        event_title = event_data.get("question", "")
+        normalization_result = self.fusion_engine.normalize_all_predictions(
+            fused_outcomes,
+            event_title=event_title,
+            event_rules=event_data.get("rules", ""),
+            now_probabilities=[
+                outcome.get("market_prob")
+                for outcome in fused_outcomes
+                if outcome.get("market_prob") is not None
+            ]
+        )
+
+        fused_outcomes = normalization_result["normalized_outcomes"]
+
+        print(f"📊 归一化结果:")
+        total_before = normalization_result.get('total_before')
+        total_after = normalization_result.get('total_after')
+        error = normalization_result.get('error', 0)
+        skipped_count = normalization_result.get('skipped_count', 0)
+
+        try:
+            if total_before is not None:
+                total_before = total_before or 0.0
+                if total_before is None:
+                    print("⚙️ [SAFE] 修复空值保护: total_before")
+                    total_before = 0.0
+                print(f"   归一化前总和: {float(total_before or 0.0):.2f}%")
+            else:
+                print(f"   归一化前总和: N/A")
+
+            if total_after is not None:
+                total_after = total_after or 0.0
+                if total_after is None:
+                    print("⚙️ [SAFE] 修复空值保护: total_after")
+                    total_after = 0.0
+                print(f"   归一化后总和: {float(total_after or 0.0):.2f}%")
+            else:
+                print(f"   归一化后总和: N/A（条件事件未归一化）")
+
+            if error is not None:
+                error = error or 0.0
+                if error is None:
+                    print("⚙️ [SAFE] 修复空值保护: error")
+                    error = 0.0
+                print(f"   误差: {float(error or 0.0):.4f}%")
+            else:
+                print(f"   误差: N/A")
+
+            print(f"   跳过选项: {skipped_count} 个")
+        except (TypeError, ValueError):
+            print("  ⚠️ 归一化结果数据格式错误，跳过格式化")
+            print(f"   跳过选项: {skipped_count} 个")
+
+        if normalization_result.get('total_after', 0) == 0 and normalization_result.get('total_before', 0) > 0:
+            print(f"⚠️ [WARNING] 归一化异常：total_before={normalization_result['total_before']}，但 total_after=0")
+        print(f"[DEBUG] normalization_result keys: {list(normalization_result.keys())}")
+        print(f"[DEBUG] normalization_result['total_after'] = {normalization_result.get('total_after')}")
+
+        print(f"📊 归一化后 fused_outcomes 数量: {len(fused_outcomes)}")
+
+        trade_signal_info = None
+        if fused_outcomes:
+            def _diff_metric(outcome):
+                ai_val = outcome.get("model_only_prob")
+                if ai_val is None:
+                    ai_val = outcome.get("prediction", 0.0)
+                return abs((ai_val or 0.0) - (outcome.get("market_prob") or 0.0))
+
+            top_outcome = max(fused_outcomes, key=_diff_metric)
+            ai_prob_trade = top_outcome.get("model_only_prob")
+            if ai_prob_trade is None:
+                ai_prob_trade = top_outcome.get("prediction")
+            market_prob_trade = top_outcome.get("market_prob")
+            days_to_resolution = event_data.get("days_left") or 30
+            uncertainty_ratio = (top_outcome.get("uncertainty") or 0.0) / 100.0
+            trade_data = self.fusion_engine.evaluate_trade_signal(
+                ai_prob_trade,
+                market_prob_trade,
+                days_to_resolution,
+                uncertainty_ratio
+            )
+            print(
+                f"[TRADE_SIGNAL] computed option={top_outcome.get('name', 'N/A')} "
+                f"signal={trade_data.get('signal')} ev={trade_data.get('ev')}"
+            )
+            trade_signal_info = {
+                **trade_data,
+                "option": top_outcome.get("name", "N/A"),
+                "option_id": top_outcome.get("id"),
+                "option_slug": top_outcome.get("slug")
+            }
+
+        multi_option_fusion_result: Dict[str, Any] = {"deepseek_reasoning": deepseek_reasoning}
+        if trade_signal_info:
+            multi_option_fusion_result["trade_signal"] = trade_signal_info
+            multi_option_fusion_result["ev"] = trade_signal_info.get("ev")
+            multi_option_fusion_result["annualized_ev"] = trade_signal_info.get("annualized_ev")
+            multi_option_fusion_result["risk_factor"] = trade_signal_info.get("risk_factor")
+            multi_option_fusion_result["signal"] = trade_signal_info.get("signal")
+            multi_option_fusion_result["signal_reason"] = trade_signal_info.get("signal_reason")
+
+        output = self.output_formatter.format_multi_option_prediction(
+            event_data=event_data,
+            outcomes=fused_outcomes,
+            normalization_info=normalization_result,
+            fusion_result=multi_option_fusion_result,
+            trade_signal=trade_signal_info
+        )
+
+        print(f"📤 准备发送输出，长度: {len(output)} 字符")
+        await maybe_await(update.message.reply_text(
+            output,
+            parse_mode="Markdown"
+        ))
+
+        if self.notion_logger:
+            if not self.notion_logger.enabled:
+                print("⚠️ Notion Logger 未启用，跳过记录（多选项事件）")
+        if self.notion_logger and self.notion_logger.enabled:
+            try:
+                aggregated_fusion_result = {
+                    "summary": fused_outcomes[0].get("summary", "暂无摘要") if fused_outcomes else "暂无摘要",
+                    "deepseek_reasoning": deepseek_reasoning,
+                    "model_versions": None,
+                    "weight_source": None
+                }
+
+                if fused_outcomes and len(fused_outcomes) > 0:
+                    first_outcome = fused_outcomes[0]
+                    if "model_versions" in first_outcome:
+                        aggregated_fusion_result["model_versions"] = first_outcome["model_versions"]
+                    if "weight_source" in first_outcome:
+                        aggregated_fusion_result["weight_source"] = first_outcome["weight_source"]
+
+                if "models" not in aggregated_fusion_result:
+                    model_versions = aggregated_fusion_result.get("model_versions", {})
+                    if model_versions:
+                        aggregated_fusion_result["models"] = [
+                            info.get("display_name", model_id)
+                            for model_id, info in model_versions.items()
+                        ]
+                    else:
+                        aggregated_fusion_result["models"] = model_names
+
+                if "run_id" not in aggregated_fusion_result:
+                    import uuid
+                    aggregated_fusion_result["run_id"] = str(uuid.uuid4())
+
+                event_data_for_notion = event_data.copy()
+                if full_analysis:
+                    event_data_for_notion["category"] = full_analysis.get(
+                        "event_category_display",
+                        full_analysis.get("event_category", "-")
+                    )
+                if "outcomes" not in event_data_for_notion and fused_outcomes:
+                    event_data_for_notion["outcomes"] = [outcome.get("name", "-") for outcome in fused_outcomes[:1]]
+
+                self.notion_logger.log_prediction(
+                    event_data=event_data_for_notion,
+                    fusion_result=aggregated_fusion_result,
+                    full_analysis=full_analysis,
+                    outcomes=fused_outcomes,
+                    normalization_info=normalization_result,
+                    trade_signal=None
+                )
+            except Exception as e:
+                print(f"⚠️ Notion Logger 记录失败: {e}")
+
+    async def handle_predict(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /predict command."""
+        message_text = await self._prepare_prediction_context(update, context)
+        if message_text is None:
+            return
+
         try:
             # Parse event
             event_info = self.event_manager.parse_event_from_message(message_text)
@@ -297,43 +1060,15 @@ class ForecastingBot:
                 ))
                 return
             
-            # Fetch Polymarket data
-            await maybe_await(update.message.reply_text("🔍 正在获取市场数据..."))
-            print(f"🔍 开始获取市场数据，event_info: {event_info}")
-            try:
-                event_data = await asyncio.wait_for(
-                    self.event_manager.fetch_polymarket_data(event_info),
-                    timeout=25.0  # 减少到25秒，加快失败恢复
-                )
-                if event_data:
-                    print(f"✅ 成功获取市场数据:")
-                    print(f"  question: {event_data.get('question', 'N/A')[:80]}")
-                    print(f"  market_prob: {event_data.get('market_prob', 'N/A')}")
-                    print(f"  is_mock: {event_data.get('is_mock', False)}")
-                else:
-                    print(f"⚠️ event_data 为 None")
-            except asyncio.TimeoutError:
-                print(f"⏱️ 获取市场数据超时")
-                await maybe_await(update.message.reply_text(
-                    "⏱️ 获取市场数据超时，将使用 AI 模型进行预测。",
-                    parse_mode="Markdown"
-                ))
-                # Create mock data
-                event_data = self.event_manager._create_mock_market_data(event_info.get('query', ''))
-                event_data["is_mock"] = True
+            event_data = await self._fetch_event_data(update, event_info)
+            (
+                event_analysis,
+                full_analysis,
+                news_summary,
+                model_names
+            ) = await self._analyze_event(event_data, event_info)
             
-            if not event_data:
-                print(f"❌ 未能获取市场数据，创建mock数据")
-                await maybe_await(update.message.reply_text(
-                    self.output_formatter.format_error(
-                        "获取市场数据失败，将使用 AI 模型进行预测。"
-                    ),
-                    parse_mode="Markdown"
-                ))
-                # Create mock data to continue
-                event_data = self.event_manager._create_mock_market_data(event_info.get('query', ''))
-                event_data["is_mock"] = True
-            
+            # Get model assignments from analysis
             # 全面分析事件（包含市场趋势、事件类别、舆情信号、规则摘要）
             # 添加超时保护，避免分析步骤阻塞主流程
             market_slug = event_info.get('slug')
@@ -470,114 +1205,25 @@ class ForecastingBot:
                 ))
                 
                 # Sequentially call models for each outcome
-                outcome_predictions = {}
+                outcome_predictions: Dict[str, Dict[str, Optional[Dict[str, Any]]]] = {}
                 for outcome in outcomes:
                     outcome_name = outcome["name"]
                     print(f"\n🎯 处理选项: {outcome_name}")
-                    prompts = {}
-                    for model_name in model_names:
-                        assignment = model_assignments.get(model_name)
-                        option_event_data = event_data.copy()
-                        option_event_data["question"] = f"{event_data.get('question', '')} - {outcome_name}"
-                        option_event_data["market_prob"] = outcome["market_prob"]
-                        prompt = self.prompt_builder.build_prompt(
-                            option_event_data,
-                            model_name,
-                            model_assignment=assignment
-                        )
-                        prompts[model_name] = prompt
-                        if assignment:
-                            print(f"   - {model_name}: {assignment['dimension_name']}")
+                    prompts = self._gather_multi_option_prompts(
+                        event_data=event_data,
+                        model_assignments=model_assignments,
+                        model_names=model_names,
+                        outcome=outcome
+                    )
                     if not prompts:
                         print("   ⚠️ 无可用模型，使用市场价格")
                         outcome_predictions[outcome_name] = {}
                         continue
                     
-                    # 【Bug修复】增加重试机制
-                    max_retries = 2
-                    model_results = {}
-                    timeout = min(
-                        self.model_orchestrator.MAX_TOTAL_WAIT_TIME,
-                        30.0  # 每个选项最多30秒
+                    outcome_predictions[outcome_name] = await self._run_multi_option_models(
+                        outcome_name=outcome_name,
+                        prompts=prompts
                     )
-                    
-                    for retry in range(max_retries):
-                        try:
-                            print(f"📤 调用 {len(prompts)} 个模型（尝试 {retry + 1}/{max_retries}）")
-                            model_results = await asyncio.wait_for(
-                                self.model_orchestrator.call_all_models(prompts),
-                                timeout=timeout
-                            )
-                            success_count = sum(1 for r in model_results.values() if r)
-                            
-                            # 如果有成功的结果，跳出重试循环
-                            if success_count > 0:
-                                break
-                            
-                            # 如果没有成功结果且还有重试机会，等待后重试
-                            if retry < max_retries - 1 and success_count == 0:
-                                print(f"  ⚠️ {outcome_name} 首次调用无结果，等待 1 秒后重试...")
-                                await asyncio.sleep(1)
-                                continue
-                            
-                        except asyncio.TimeoutError:
-                            if retry < max_retries - 1:
-                                print(f"  ⏱️ {outcome_name} 超时（>{timeout}s），重试 {retry + 1}/{max_retries}...")
-                                await asyncio.sleep(1)  # 等待1秒后重试
-                                continue
-                            else:
-                                print(f"  ⏱️ [ERROR] {outcome_name} 重试后仍超时（>{timeout}s），使用市场价格")
-                                model_results = {}
-                                break
-                        except Exception as e:
-                            if retry < max_retries - 1:
-                                print(f"  ⚠️ {outcome_name} 调用异常 ({type(e).__name__})，重试 {retry + 1}/{max_retries}...")
-                                await asyncio.sleep(1)
-                                continue
-                            else:
-                                print(f"  ❌ [ERROR] {outcome_name} 重试后仍异常: {type(e).__name__}: {e}")
-                                model_results = {}
-                                break
-                    
-                    # 【Bug修复】调用 OpenRouter 免费模型作为辅助层（多选项事件）
-                    if OPENROUTER_INTEGRATION_AVAILABLE and is_openrouter_available():
-                        openrouter_models = get_openrouter_models()
-                        # 只调用第一个模型（多选项事件时减少调用）
-                        if openrouter_models:
-                            selected_model = openrouter_models[0]
-                            # 使用当前选项的 prompt
-                            option_prompt = list(prompts.values())[0] if prompts else ""
-                            
-                            try:
-                                openrouter_result = await asyncio.wait_for(
-                                    call_openrouter_model(selected_model, option_prompt),
-                                    timeout=25.0
-                                )
-                                
-                                if openrouter_result:
-                                    display_name = selected_model.split('/')[-1]
-                                    model_results[f"openrouter_{display_name}"] = openrouter_result
-                                    print(f"✅ [OpenRouter] {display_name} 调用成功（{outcome_name}）")
-                                
-                            except Exception as e:
-                                print(f"⚠️ [OpenRouter] {outcome_name} 调用异常: {type(e).__name__}")
-                    
-                    # 【Bug修复】计算成功数量（包括 OpenRouter）
-                    success_count = sum(1 for r in model_results.values() if r)
-                    expected_count = len(prompts) + (
-                        1 if OPENROUTER_INTEGRATION_AVAILABLE and is_openrouter_available() and get_openrouter_models() else 0
-                    )
-                    print(f"📥 {outcome_name} 收到 {success_count}/{expected_count} 个模型响应")
-                    
-                    # 【Bug修复】增强调试日志
-                    if success_count == 0:
-                        print(f"  ⚠️ [WARNING] {outcome_name} 所有模型调用失败，将使用市场价格")
-                        print(f"  [DEBUG] 模型结果详情: {model_results}")
-                        print(f"  [DEBUG] 是否有结果: {bool(model_results)}, 结果数量: {len(model_results)}")
-                    else:
-                        print(f"  ✅ {outcome_name} 成功获得 {success_count} 个模型响应")
-                    
-                    outcome_predictions[outcome_name] = model_results
                     await asyncio.sleep(0.5)
                 
                 # Fuse predictions for each outcome
@@ -586,525 +1232,47 @@ class ForecastingBot:
                     for model_name in model_names
                 }
                 
-                fused_outcomes = []
-                # 收集 DeepSeek reasoning（所有 outcome 共享）
-                deepseek_reasoning = None
+                fused_outcomes: List[Dict[str, Any]] = []
+                deepseek_reasoning: Optional[str] = None
                 
                 for outcome in outcomes:
                     outcome_name = outcome["name"]
                     outcome_results = outcome_predictions.get(outcome_name, {})
-                    
-                    # 【Bug修复】改进空结果判断：检查是否有有效的（非 None）模型结果
-                    # 关键修复：不仅检查字典长度，还要检查值的有效性
-                    valid_count = sum(1 for r in outcome_results.values() if r is not None)
-                    
-                    if valid_count > 0:
-                        # 有有效的模型结果，进行融合
-                        fusion_result = self.fusion_engine.fuse_predictions(
-                            model_results=outcome_results,
-                            model_weights=model_weights,
-                            market_prob=outcome["market_prob"],
-                            orchestrator=self.model_orchestrator  # Pass orchestrator for version info
-                        )
-                        # 提取 DeepSeek reasoning（第一个有效的）
-                        if not deepseek_reasoning and fusion_result.get("deepseek_reasoning"):
-                            deepseek_reasoning = fusion_result.get("deepseek_reasoning")
-                        
-                        fused_outcomes.append({
-                            "name": outcome_name,
-                            "prediction": fusion_result["final_prob"],
-                            "market_prob": outcome["market_prob"],
-                            "uncertainty": fusion_result["uncertainty"],
-                            "summary": fusion_result["summary"],
-                            "model_only_prob": fusion_result.get("model_only_prob"),  # 保存纯AI预测
-                            "model_versions": fusion_result.get("model_versions", {}),  # 保存模型版本信息
-                            "weight_source": fusion_result.get("weight_source", {}),  # 保存权重来源信息
-                            "deepseek_reasoning": fusion_result.get("deepseek_reasoning")  # 保存 DeepSeek reasoning
-                        })
-                        # 【防御】确保 final_prob 不为 None
-                        final_prob = fusion_result.get('final_prob') or 0.0
-                        if final_prob is None:
-                            print(f"⚠️ final_prob is None for {outcome_name}, using default 0.0")
-                            final_prob = 0.0
-                        model_only_prob_display = fusion_result.get('model_only_prob')
-                        if model_only_prob_display is None:
-                            model_only_prob_display = 'N/A'
-                        else:
-                            # 【防御】确保 model_only_prob_display 不为 None
-                            model_only_prob_display = model_only_prob_display or 0.0
-                            if model_only_prob_display is None:
-                                print("⚙️ [SAFE] 修复空值保护: model_only_prob_display")
-                                model_only_prob_display = 0.0
-                            model_only_prob_display = f"{(model_only_prob_display or 0.0):.1f}%"
-                        print(f"  ✅ 融合完成: {outcome_name} = {(final_prob or 0.0):.1f}% (AI: {model_only_prob_display})")
-                    else:
-                        # 【Bug修复】明确处理：所有模型调用失败/超时，使用市场价格
-                        # outcome_results 为空字典 {} 或所有值都是 None
-                        if not outcome_results:
-                            reason = "无模型结果"
-                        elif valid_count == 0:
-                            reason = "所有模型调用失败/超时"
-                        else:
-                            reason = "无有效模型结果"
-                        
-                        fused_outcomes.append({
-                            "name": outcome_name,
-                            "prediction": outcome["market_prob"],  # Use market prob as default
-                            "market_prob": outcome["market_prob"],
-                            "uncertainty": 10.0,  # Default uncertainty
-                            "summary": f"⚠️ {reason}，暂无 AI 模型预测，显示市场价格",
-                            "model_only_prob": None  # 明确标记为 None，表示没有AI预测
-                        })
-                        # 【防御】确保 market_prob 不为 None
-                        market_prob = outcome.get('market_prob') or 0.0
-                        if market_prob is None:
-                            print(f"⚠️ market_prob is None for {outcome_name}, using default 0.0")
-                            market_prob = 0.0
-                        print(f"  ⚠️ 无AI预测: {outcome_name}（{reason}，有效结果数: {valid_count}），使用市场价格 {(market_prob or 0.0):.1f}%")
-                
-                # Final safety check: ensure we have at least market data
-                # This should never be empty if outcomes exist, but add as ultimate fallback
-                if not fused_outcomes:
-                    if outcomes and len(outcomes) > 0:
-                        print(f"⚠️ fused_outcomes 为空，从原始 outcomes 创建 fallback 数据...")
-                        fused_outcomes = [{
-                            "name": outcome["name"],
-                            "prediction": outcome["market_prob"],
-                            "market_prob": outcome["market_prob"],
-                            "uncertainty": 10.0,
-                            "summary": "暂无 AI 模型预测，显示市场价格。",
-                            "model_only_prob": None
-                        } for outcome in outcomes]
-                        print(f"✅ 创建了 {len(fused_outcomes)} 个 fallback outcomes")
-                    else:
-                        print(f"❌ 严重错误：既没有 fused_outcomes 也没有 outcomes！")
-                
-                # 【关键改进】归一化所有 AI 预测概率，使总和为 100%
-                print(f"📊 归一化前 fused_outcomes 数量: {len(fused_outcomes)}")
-                # 【新增】传递事件标题以进行事件类型识别
-                event_title = event_data.get("question", "")
-                normalization_result = self.fusion_engine.normalize_all_predictions(
-                    fused_outcomes,
-                    event_title=event_title,
-                    event_rules=event_data.get("rules", ""),
-                    now_probabilities=[
-                        outcome.get("market_prob")
-                        for outcome in fused_outcomes
-                        if outcome.get("market_prob") is not None
-                    ]
-                )
-                
-                fused_outcomes = normalization_result["normalized_outcomes"]
-                
-                print(f"📊 归一化结果:")
-                # 【修复】确保值不为 None 再格式化
-                total_before = normalization_result.get('total_before')
-                total_after = normalization_result.get('total_after')
-                error = normalization_result.get('error', 0)
-                skipped_count = normalization_result.get('skipped_count', 0)
-                
-                try:
-                    # 【防御】确保所有值不为 None
-                    if total_before is not None:
-                        total_before = total_before or 0.0
-                        if total_before is None:
-                            print("⚙️ [SAFE] 修复空值保护: total_before")
-                            total_before = 0.0
-                        print(f"   归一化前总和: {float(total_before or 0.0):.2f}%")
-                    else:
-                        print(f"   归一化前总和: N/A")
-                    
-                    if total_after is not None:
-                        total_after = total_after or 0.0
-                        if total_after is None:
-                            print("⚙️ [SAFE] 修复空值保护: total_after")
-                            total_after = 0.0
-                        print(f"   归一化后总和: {float(total_after or 0.0):.2f}%")
-                    else:
-                        print(f"   归一化后总和: N/A（条件事件未归一化）")
-                    
-                    if error is not None:
-                        error = error or 0.0
-                        if error is None:
-                            print("⚙️ [SAFE] 修复空值保护: error")
-                            error = 0.0
-                        print(f"   误差: {float(error or 0.0):.4f}%")
-                    else:
-                        print(f"   误差: N/A")
-                    
-                    print(f"   跳过选项: {skipped_count} 个")
-                except (TypeError, ValueError):
-                    print("  ⚠️ 归一化结果数据格式错误，跳过格式化")
-                    print(f"   跳过选项: {skipped_count} 个")
-                
-                # 【Bug修复】验证 normalization_result 的完整性
-                if normalization_result.get('total_after', 0) == 0 and normalization_result.get('total_before', 0) > 0:
-                    print(f"⚠️ [WARNING] 归一化异常：total_before={normalization_result['total_before']}，但 total_after=0")
-                print(f"[DEBUG] normalization_result keys: {list(normalization_result.keys())}")
-                print(f"[DEBUG] normalization_result['total_after'] = {normalization_result.get('total_after')}")
-                
-                print(f"📊 归一化后 fused_outcomes 数量: {len(fused_outcomes)}")
-
-                # Compute trade signal from the option with the largest AI-market gap
-                trade_signal_info = None
-                if fused_outcomes:
-                    def _diff_metric(outcome):
-                        ai_val = outcome.get("model_only_prob")
-                        if ai_val is None:
-                            ai_val = outcome.get("prediction", 0.0)
-                        return abs((ai_val or 0.0) - (outcome.get("market_prob") or 0.0))
-                    top_outcome = max(fused_outcomes, key=_diff_metric)
-                    ai_prob_trade = top_outcome.get("model_only_prob")
-                    if ai_prob_trade is None:
-                        ai_prob_trade = top_outcome.get("prediction")
-                    market_prob_trade = top_outcome.get("market_prob")
-                    days_to_resolution = event_data.get("days_left") or 30
-                    uncertainty_ratio = (top_outcome.get("uncertainty") or 0.0) / 100.0
-                    trade_data = self.fusion_engine.evaluate_trade_signal(
-                        ai_prob_trade,
-                        market_prob_trade,
-                        days_to_resolution,
-                        uncertainty_ratio
+                    fused_outcome, deepseek_reasoning = self._fuse_multi_option_outcome(
+                        outcome=outcome,
+                        outcome_results=outcome_results,
+                        model_weights=model_weights,
+                        current_reasoning=deepseek_reasoning
                     )
-                    print(
-                        f"[TRADE_SIGNAL] computed option={top_outcome.get('name', 'N/A')} "
-                        f"signal={trade_data.get('signal')} ev={trade_data.get('ev')}"
-                    )
-                    trade_signal_info = {
-                        **trade_data,
-                        "option": top_outcome.get("name", "N/A"),
-                        "option_id": top_outcome.get("id"),
-                        "option_slug": top_outcome.get("slug")
-                    }
+                    fused_outcomes.append(fused_outcome)
                 
-                # Format multi-option output
-                # 传递归一化结果和 DeepSeek reasoning 给输出层
-                # 【修复】确保 fusion_result 包含 trade_signal 字段
-                multi_option_fusion_result = {"deepseek_reasoning": deepseek_reasoning}
-                if trade_signal_info:
-                    # 将 trade signal 数据添加到 fusion_result 中
-                    multi_option_fusion_result["trade_signal"] = trade_signal_info
-                    multi_option_fusion_result["ev"] = trade_signal_info.get("ev")
-                    multi_option_fusion_result["annualized_ev"] = trade_signal_info.get("annualized_ev")
-                    multi_option_fusion_result["risk_factor"] = trade_signal_info.get("risk_factor")
-                    multi_option_fusion_result["signal"] = trade_signal_info.get("signal")
-                    multi_option_fusion_result["signal_reason"] = trade_signal_info.get("signal_reason")
-                
-                output = self.output_formatter.format_multi_option_prediction(
+                await self._finalize_multi_option_response(
+                    update=update,
                     event_data=event_data,
-                    outcomes=fused_outcomes,
-                    normalization_info=normalization_result,  # 传递归一化信息
-                    fusion_result=multi_option_fusion_result,  # 包含 trade_signal 字段
-                    trade_signal=trade_signal_info
+                    fused_outcomes=fused_outcomes,
+                    raw_outcomes=outcomes,
+                    full_analysis=full_analysis,
+                    deepseek_reasoning=deepseek_reasoning,
+                    model_names=model_names
                 )
-                
-                print(f"📤 准备发送输出，长度: {len(output)} 字符")
-                
-                await maybe_await(update.message.reply_text(
-                    output,
-                    parse_mode="Markdown"
-                ))
-                
-                # 记录到 Notion（多选项事件）
-                # 需要收集所有选项的融合结果信息
-                if self.notion_logger:
-                    if not self.notion_logger.enabled:
-                        print("⚠️ Notion Logger 未启用，跳过记录（多选项事件）")
-                if self.notion_logger and self.notion_logger.enabled:
-                    try:
-                        # 从第一个 outcome 中提取 fusion_result 信息（所有选项共享）
-                        # 或者使用最近一次融合的结果
-                        # 由于多选项事件中每个选项都有独立的 fusion，我们需要构造一个聚合的 fusion_result
-                        aggregated_fusion_result = {
-                            "summary": fused_outcomes[0].get("summary", "暂无摘要") if fused_outcomes else "暂无摘要",
-                            "deepseek_reasoning": deepseek_reasoning,
-                            # 尝试从 outcomes 中提取 model_versions 和 weight_source
-                            "model_versions": None,
-                            "weight_source": None
-                        }
-                        
-                        # 从第一个 outcome 中提取模型版本信息
-                        if fused_outcomes and len(fused_outcomes) > 0:
-                            first_outcome = fused_outcomes[0]
-                            if "model_versions" in first_outcome:
-                                aggregated_fusion_result["model_versions"] = first_outcome["model_versions"]
-                            if "weight_source" in first_outcome:
-                                aggregated_fusion_result["weight_source"] = first_outcome["weight_source"]
-                        
-                        # 确保 aggregated_fusion_result 包含必要字段
-                        # 添加 models 列表
-                        if "models" not in aggregated_fusion_result:
-                            model_versions = aggregated_fusion_result.get("model_versions", {})
-                            if model_versions:
-                                aggregated_fusion_result["models"] = [
-                                    info.get("display_name", model_id)
-                                    for model_id, info in model_versions.items()
-                                ]
-                            else:
-                                aggregated_fusion_result["models"] = model_names if 'model_names' in locals() else []
-                        # 添加 run_id
-                        if "run_id" not in aggregated_fusion_result:
-                            import uuid
-                            aggregated_fusion_result["run_id"] = str(uuid.uuid4())
-                        
-                        # 确保 event_data 包含必要字段
-                        event_data_for_notion = event_data.copy()
-                        # 添加 category 字段
-                        if full_analysis:
-                            event_data_for_notion["category"] = full_analysis.get("event_category_display",
-                                full_analysis.get("event_category", "-"))
-                        # 确保 outcomes 字段存在
-                        if "outcomes" not in event_data_for_notion and fused_outcomes:
-                            event_data_for_notion["outcomes"] = [outcome.get("name", "-") for outcome in fused_outcomes[:1]]
-                        
-                        self.notion_logger.log_prediction(
-                            event_data=event_data_for_notion,
-                            fusion_result=aggregated_fusion_result,
-                            full_analysis=full_analysis,
-                            outcomes=fused_outcomes,
-                            normalization_info=normalization_result,
-                            trade_signal=None
-                        )
-                    except Exception as e:
-                        print(f"⚠️ Notion Logger 记录失败: {e}")
             else:
-                # Binary event: existing logic
-                # Use the model_assignments we already got from event_analysis above (line 168)
-                # Build specialized prompts for each model
-                prompts = {}
-                for model_name in model_names:
-                    assignment = model_assignments.get(model_name)
-                    prompt = self.prompt_builder.build_prompt(
-                        event_data, 
-                        model_name, 
-                        model_assignment=assignment
-                    )
-                    prompts[model_name] = prompt
-                    
-                    if assignment:
-                        print(f"  ✅ {model_name}: {assignment['dimension_name']}")
-                
-                # Call all models in parallel with timeout
-                await maybe_await(update.message.reply_text("🤖 正在查询 AI 模型..."))
-                print(f"\n📞 Calling {len(prompts)} models: {list(prompts.keys())}")
-                
-                try:
-                    # Add overall timeout for model calls
-                    # Use model_orchestrator's timeout constant for consistency
-                    timeout = self.model_orchestrator.MAX_TOTAL_WAIT_TIME
-                    model_results = await asyncio.wait_for(
-                        self.model_orchestrator.call_all_models(prompts),
-                        timeout=float(timeout)
-                    )
-                    
-                    # 检查是否有任何模型成功
-                    success_count = sum(1 for r in model_results.values() if r is not None)
-                    
-                    # 【新增】调用 OpenRouter 免费模型作为辅助层（单选项事件）
-                    if OPENROUTER_INTEGRATION_AVAILABLE and is_openrouter_available():
-                        print(f"\n🆓 [OpenRouter] 调用免费模型作为辅助层...")
-                        openrouter_models = get_openrouter_models()
-                        # 只调用前 2 个模型（避免过多调用）
-                        selected_models = openrouter_models[:2] if len(openrouter_models) >= 2 else openrouter_models
-                        
-                        if selected_models:
-                            # 使用通用 prompt（第一个模型的 prompt）
-                            common_prompt = list(prompts.values())[0] if prompts else ""
-                            
-                            try:
-                                openrouter_results = await asyncio.wait_for(
-                                    call_multiple_openrouter_models(selected_models, common_prompt),
-                                    timeout=30.0  # OpenRouter 超时时间
-                                )
-                                
-                                # 合并 OpenRouter 结果到 model_results
-                                openrouter_success = 0
-                                for model_name, result in openrouter_results.items():
-                                    if result:
-                                        # 使用简短的显示名称
-                                        display_name = model_name.split('/')[-1]  # 例如 "mistral-7b-instruct"
-                                        model_results[f"openrouter_{display_name}"] = result
-                                        openrouter_success += 1
-                                
-                                if openrouter_success > 0:
-                                    print(f"✅ [OpenRouter] {openrouter_success}/{len(selected_models)} 个模型调用成功")
-                                    success_count += openrouter_success
-                                else:
-                                    print(f"⚠️ [OpenRouter] 所有模型调用失败")
-                                    
-                            except asyncio.TimeoutError:
-                                print(f"⏱️ [OpenRouter] 调用超时，跳过")
-                            except Exception as e:
-                                print(f"⚠️ [OpenRouter] 调用异常: {type(e).__name__}: {e}")
-                    else:
-                        print(f"ℹ️ [OpenRouter] API 密钥未配置，跳过免费模型调用")
-                    
-                    if success_count == 0:
-                        # 所有模型都失败了，但仍然尝试用市场价格继续
-                        print(f"⚠️ [WARNING] 所有模型调用失败，使用市场价格作为fallback")
-                        await maybe_await(update.message.reply_text(
-                            "⚠️ AI模型暂时无响应，将使用市场价格进行预测。",
-                            parse_mode="Markdown"
-                        ))
-                        # 继续执行，使用市场价格
-                    elif success_count < len(prompts):
-                        # 部分模型成功，提示用户但继续
-                        print(f"⚠️ [WARNING] 部分模块响应慢：{success_count}/{len(prompts)} 个模型成功")
-                        # 不发送额外消息，直接继续（避免过多提示）
-                        
-                except asyncio.TimeoutError:
-                    print(f"⏱️ [ERROR] 模型查询总超时（>{timeout}s）")
-                    import traceback
-                    print(f"[DEBUG] Timeout exception traceback:")
-                    traceback.print_exc()
-                    
-                    # 尝试获取已完成的模型结果（即使部分失败）
-                    # 由于call_all_models内部有超时保护，可能已有部分结果
-                    try:
-                        # 如果call_all_models已完成（即使超时），可能已返回部分结果
-                        # 这里我们尝试继续，使用已有的结果或市场价格
-                        # 实际上call_all_models应该已经返回了，所以这里尝试使用默认值
-                        model_results = {
-                            name: {
-                                "probability": 50.0,
-                                "confidence": "low",
-                                "reasoning": "Overall timeout"
-                            }
-                            for name in prompts.keys()
-                        }
-                        await maybe_await(update.message.reply_text(
-                            "⚠️ 部分模块响应延迟，结果可能不完全准确。",
-                            parse_mode="Markdown"
-                        ))
-                        # 继续执行，不return，让系统尝试用市场价格继续
-                    except Exception as e:
-                        print(f"❌ [ERROR] 处理超时异常失败: {type(e).__name__}: {e}")
-                        import traceback
-                        traceback.print_exc()
-                        await maybe_await(update.message.reply_text(
-                            "⏱️ 模型查询超时，请稍后重试。",
-                            parse_mode="Markdown"
-                        ))
-                        return
-                
-                # Debug: Print results
-                print(f"\n📊 Model Results:")
-                for model_name, result in model_results.items():
-                    if result:
-                        print(f"  ✅ {model_name}: {result.get('probability')}% ({result.get('confidence')})")
-                    else:
-                        print(f"  ❌ {model_name}: No response")
-                
-                # Get model weights
-                model_weights = {
-                    model_name: self.model_orchestrator.get_model_weight(model_name)
-                    for model_name in model_names
-                }
-                
-                # 【新增】为 OpenRouter 模型添加权重（使用较低的权重，因为是辅助层）
-                if OPENROUTER_INTEGRATION_AVAILABLE and is_openrouter_available():
-                    openrouter_models = get_openrouter_models()
-                    # 只添加实际调用成功的 OpenRouter 模型
-                    for model_name in openrouter_models[:2]:  # 只考虑前2个
-                        display_name = model_name.split('/')[-1]
-                        openrouter_key = f"openrouter_{display_name}"
-                        # 检查是否在 model_results 中（说明调用成功）
-                        if openrouter_key in model_results and model_results[openrouter_key]:
-                            # OpenRouter 模型权重较低（0.5），作为辅助层
-                            model_weights[openrouter_key] = 0.5
-                
-                # Fuse predictions
-                fusion_result = self.fusion_engine.fuse_predictions(
-                    model_results=model_results,
-                    model_weights=model_weights,
-                    market_prob=event_data["market_prob"],
-                    orchestrator=self.model_orchestrator  # Pass orchestrator for version info
-                )
-                
-                trade_signal_data = None
-                if fusion_result:
-                    ai_prob_trade = fusion_result.get("model_only_prob")
-                    if ai_prob_trade is None:
-                        ai_prob_trade = fusion_result.get("final_prob")
-                    market_prob_trade = event_data.get("market_prob")
-                    # [FIX] Preserve legitimate 0.0 market probabilities when computing trade signals.
-                    market_prob_trade = market_prob_trade if market_prob_trade is not None else fusion_result.get("final_prob")
-                    days_to_resolution = event_data.get("days_left") or 30
-                    uncertainty_ratio = (fusion_result.get("uncertainty") or 0.0) / 100.0
-                    trade_signal_data = self.fusion_engine.evaluate_trade_signal(
-                        ai_prob_trade,
-                        market_prob_trade,
-                        days_to_resolution,
-                        uncertainty_ratio
-                    )
-                    print(
-                        f"[TRADE_SIGNAL] computed event={event_data.get('question', 'N/A')} "
-                        f"signal={trade_signal_data.get('signal')} ev={trade_signal_data.get('ev')}"
-                    )
-                    # 【修复】确保 fusion_result 包含所有 trade signal 字段
-                    fusion_result["trade_signal"] = trade_signal_data
-                    fusion_result["ev"] = trade_signal_data.get("ev")
-                    fusion_result["annualized_ev"] = trade_signal_data.get("annualized_ev")
-                    fusion_result["risk_factor"] = trade_signal_data.get("risk_factor")
-                    fusion_result["signal"] = trade_signal_data.get("signal")
-                    fusion_result["signal_reason"] = trade_signal_data.get("signal_reason")
-                
-                # Format and send output
-                output = self.output_formatter.format_prediction(
+                prompts = self._build_binary_prompts(
                     event_data=event_data,
-                    fusion_result=fusion_result,
-                    trade_signal=trade_signal_data
+                    model_assignments=model_assignments,
+                    model_names=model_names
                 )
                 
-                await maybe_await(update.message.reply_text(
-                    output,
-                    parse_mode="Markdown"
-                ))
+                model_results = await self._call_binary_models(update, prompts)
+                if model_results is None:
+                    return
                 
-                # 记录到 Notion（单选项事件）
-                if self.notion_logger:
-                    if not self.notion_logger.enabled:
-                        print("⚠️ Notion Logger 未启用，跳过记录（单选项事件）")
-                if self.notion_logger and self.notion_logger.enabled:
-                    try:
-                        # 确保 event_data 包含必要字段
-                        event_data_for_notion = event_data.copy()
-                        # 添加 category 字段（从 full_analysis 获取）
-                        if full_analysis:
-                            event_data_for_notion["category"] = full_analysis.get("event_category_display", 
-                                full_analysis.get("event_category", "-"))
-                        # 确保有 outcomes 字段（单选项事件只有一个选项）
-                        if "outcomes" not in event_data_for_notion:
-                            event_data_for_notion["outcomes"] = ["Yes"]  # 单选项事件默认选项
-                        
-                        # 确保 fusion_result 包含必要字段
-                        fusion_result_for_notion = fusion_result.copy()
-                        # 添加 models 列表（从 model_versions 或 model_names 提取）
-                        if "models" not in fusion_result_for_notion:
-                            model_versions = fusion_result.get("model_versions", {})
-                            if model_versions:
-                                fusion_result_for_notion["models"] = [
-                                    info.get("display_name", model_id)
-                                    for model_id, info in model_versions.items()
-                                ]
-                            else:
-                                # Fallback: 使用当前使用的模型列表
-                                fusion_result_for_notion["models"] = model_names if 'model_names' in locals() else []
-                        # 添加 run_id（如果不存在）
-                        if "run_id" not in fusion_result_for_notion:
-                            import uuid
-                            fusion_result_for_notion["run_id"] = str(uuid.uuid4())
-                        
-                        self.notion_logger.log_prediction(
-                            event_data=event_data_for_notion,
-                            fusion_result=fusion_result_for_notion,
-                            full_analysis=full_analysis,
-                            outcomes=None,
-                            normalization_info=None,
-                            trade_signal=None
-                        )
-                    except Exception as e:
-                        print(f"⚠️ Notion Logger 记录失败: {e}")
+                await self._finalize_binary_prediction(
+                    update=update,
+                    event_data=event_data,
+                    model_results=model_results,
+                    model_names=model_names,
+                    full_analysis=full_analysis
+                )
             
         except Exception as e:
             error_type = type(e).__name__

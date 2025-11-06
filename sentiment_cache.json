@@ -151,14 +151,6 @@
     "source": "GDELT",
     "timestamp": "2025-11-05T22:32:33.387289"
   },
-  "russia ukraine ceasefire": {
-    "keyword": "russia ukraine ceasefire",
-    "sentiment": "neutral",
-    "score": 0.0,
-    "sample_count": 20,
-    "source": "GDELT",
-    "timestamp": "2025-11-06T07:04:13.271328"
-  },
   "2nd largest company": {
     "keyword": "2nd largest company",
     "sentiment": "neutral",
@@ -166,5 +158,13 @@
     "sample_count": 20,
     "source": "GDELT",
     "timestamp": "2025-11-06T07:09:22.898463"
+  },
+  "russia ukraine ceasefire": {
+    "keyword": "russia ukraine ceasefire",
+    "sentiment": "neutral",
+    "score": 0.05,
+    "sample_count": 89,
+    "source": "NewsAPI",
+    "timestamp": "2025-11-06T19:29:24.875281"
   }
 }

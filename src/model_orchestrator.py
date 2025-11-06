@@ -16,6 +16,7 @@
 import aiohttp
 import asyncio
 import json
+import math
 import os
 import re
 import time
@@ -77,13 +78,27 @@ class ModelOrchestrator:
     RETRY_DELAY_MAX = 10  # 最大重试延迟（秒）
     
     # 并发控制
-    MAX_CONCURRENT_MODELS = 3  # 同时最多运行的模型数
+    MAX_CONCURRENT_MODELS = 2  # 同时最多运行的模型数（可通过环境变量覆盖）
+    
+    # 简易 Platt Scaling 参数（根据离线校准结果，可在配置中调整）
+    PLATT_PARAMS = {
+        "gpt-4o": {"A": -1.15, "B": 0.25},
+        "claude-3-7-sonnet-latest": {"A": -1.05, "B": 0.18},
+        "gemini-2.5-pro": {"A": -0.95, "B": 0.10},
+        "grok-4": {"A": -1.20, "B": 0.35},
+        "deepseek-chat": {"A": -0.85, "B": 0.05},
+        "default": {"A": 0.0, "B": 0.0}
+    }
     
     def __init__(self):
         """Initialize ModelOrchestrator and load model configurations from JSON."""
         self.models_config = self._load_models_config()
         self.MODELS = self._build_models_dict()
         self.active_models = {}  # Track actually used models (with fallback handling)
+        # 并发控制信号量，可通过环境变量 MODEL_MAX_CONCURRENCY 调整
+        concurrency_limit = int(os.getenv("MODEL_MAX_CONCURRENCY", self.MAX_CONCURRENT_MODELS))
+        self._concurrency_semaphore = asyncio.Semaphore(max(1, concurrency_limit))
+        self.current_concurrency_limit = max(1, concurrency_limit)
         self._log_model_versions()
     
     def _load_models_config(self) -> Dict:
@@ -280,6 +295,37 @@ class ModelOrchestrator:
         # 默认超时
         return self.SINGLE_MODEL_TIMEOUT
     
+    def _get_platt_params(self, model_name: str) -> Dict[str, float]:
+        return self.PLATT_PARAMS.get(model_name, self.PLATT_PARAMS.get("default", {"A": 0.0, "B": 0.0}))
+    
+    def _platt_scale_probability(self, model_name: str, probability: float) -> float:
+        """Apply Platt scaling to model probability to improve calibration."""
+        params = self._get_platt_params(model_name)
+        normalized = max(0.001, min(0.999, probability / 100.0))
+        logit = math.log(normalized / (1 - normalized))
+        logistic_input = params["A"] * logit + params["B"]
+        try:
+            scaled = 1 / (1 + math.exp(-logistic_input))
+        except OverflowError:
+            scaled = 0.0 if logistic_input < 0 else 1.0
+        return round(max(0.0, min(1.0, scaled)) * 100.0, 2)
+    
+    def _apply_probability_calibration(self, model_name: str, result: Optional[Dict]) -> Optional[Dict]:
+        if not result or "probability" not in result:
+            return result
+        calibrated = dict(result)
+        raw_prob = calibrated.get("probability", 50.0)
+        calibrated_prob = self._platt_scale_probability(model_name, raw_prob)
+        calibrated["raw_probability"] = raw_prob
+        calibrated["probability"] = calibrated_prob
+        params = self._get_platt_params(model_name)
+        calibrated["calibration"] = {
+            "method": "platt",
+            "A": params.get("A", 0.0),
+            "B": params.get("B", 0.0)
+        }
+        return calibrated
+    
     async def call_model(self, model_name: str, prompt: str, max_retries: int = None) -> Optional[Dict]:
         """
         调用单个模型（带自适应超时 + 重试机制）
@@ -312,7 +358,7 @@ class ModelOrchestrator:
                 
                 if result:
                     print(f"[DEBUG] ✅ {model_name} completed in {elapsed:.2f}s (attempt {attempt+1})")
-                    return result
+                    return self._apply_probability_calibration(model_name, result)
                 else:
                     print(f"[DEBUG] ⚠️ {model_name} returned None (attempt {attempt+1}/{max_retries})")
                     
@@ -329,11 +375,11 @@ class ModelOrchestrator:
                 else:
                     print(f"[FAIL] ❌ {model_name} failed after {max_retries} attempts (timeout).")
                     # 返回低置信度结果，确保流程不中断
-                    return {
+                    return self._apply_probability_calibration(model_name, {
                         "probability": 50.0,
                         "confidence": "low",
                         "reasoning": f"Timeout after {max_retries} attempts (last attempt exceeded {timeout_seconds}s)"
-                    }
+                    })
                     
             except Exception as e:
                 attempt_elapsed = time.time() - attempt_start
@@ -347,20 +393,20 @@ class ModelOrchestrator:
                     await asyncio.sleep(wait_time)
                 else:
                     print(f"[FAIL] ❌ {model_name} failed after {max_retries} attempts (exception).")
-                    return {
+                    return self._apply_probability_calibration(model_name, {
                         "probability": 50.0,
                         "confidence": "low",
                         "reasoning": f"Exception after {max_retries} attempts: {type(e).__name__}: {str(e)[:100]}"
-                    }
+                    })
         
         # 所有重试都失败（不应该到达这里，因为上面已经return了）
         total_elapsed = time.time() - start_time
         print(f"[DEBUG] {model_name} total elapsed {total_elapsed:.2f}s (all attempts failed)")
-        return {
+        return self._apply_probability_calibration(model_name, {
             "probability": 50.0,
             "confidence": "low",
             "reasoning": "All retry attempts failed"
-        }
+        })
     
     async def _call_model_internal(self, model_name: str, prompt: str) -> Optional[Dict]:
         """Internal method to call a model API with detailed logging."""
@@ -615,9 +661,9 @@ class ModelOrchestrator:
         overall_start_time = time.time()
         model_names = list(prompts.keys())
         print(f"\n[DEBUG] ========== call_all_models START ==========")
-        print(f"[DEBUG] Total models: {len(model_names)} | Max concurrent: {self.MAX_CONCURRENT_MODELS}")
+        print(f"[DEBUG] Total models: {len(model_names)} | Max concurrent: {self.current_concurrency_limit}")
         
-        semaphore = asyncio.Semaphore(self.MAX_CONCURRENT_MODELS)
+        semaphore = self._concurrency_semaphore
         default_response = {
             "probability": 50.0,
             "confidence": "low",
@@ -632,15 +678,26 @@ class ModelOrchestrator:
         async def guarded_call(model_name: str) -> Tuple[str, Optional[Dict]]:
             async with semaphore:
                 call_start = time.time()
+                per_model_budget = self._get_model_timeout(model_name) + 10
                 try:
-                    result = await self.call_model(model_name, prompts[model_name])
+                    result = await asyncio.wait_for(
+                        self.call_model(model_name, prompts[model_name]),
+                        timeout=per_model_budget
+                    )
                     call_duration = time.time() - call_start
                     print(f"[DEBUG] {model_name} finished in {call_duration:.2f}s")
                     return model_name, result
+                except asyncio.TimeoutError:
+                    call_duration = time.time() - call_start
+                    print(f"⏱️ [WARNING] {model_name} exceeded guarded timeout ({per_model_budget}s). Cancelling task.")
+                    return model_name, {
+                        "probability": 50.0,
+                        "confidence": "low",
+                        "reasoning": f"Guarded timeout after {call_duration:.2f}s"
+                    }
                 except Exception as e:
                     call_duration = time.time() - call_start
                     print(f"❌ [ERROR] 模型调用异常 – {model_name}: {type(e).__name__}: {e} (took {call_duration:.2f}s)")
-                    import traceback
                     traceback.print_exc()
                     return model_name, {
                         "probability": 50.0,
@@ -673,18 +730,19 @@ class ModelOrchestrator:
         for task in done:
             try:
                 model_name, result = task.result()
-                results_dict[model_name] = result or default_response.copy()
+                base = result or default_response.copy()
+                results_dict[model_name] = self._apply_probability_calibration(model_name, base)
             except Exception as e:
                 print(f"❌ [ERROR] 收集模型结果失败: {type(e).__name__}: {e}")
                 import traceback
                 traceback.print_exc()
                 # Identify associated model if possible
                 model_name = "unknown"
-                results_dict[model_name] = default_response.copy()
+                results_dict[model_name] = self._apply_probability_calibration(model_name, default_response.copy())
         
         for model_name in model_names:
             if model_name not in results_dict:
-                results_dict[model_name] = default_response.copy()
+                results_dict[model_name] = self._apply_probability_calibration(model_name, default_response.copy())
                 print(f"⚠️ [WARNING] 模型 {model_name} 未返回结果，使用默认值")
         
         success_count = sum(1 for r in results_dict.values() if r)

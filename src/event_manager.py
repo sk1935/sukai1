@@ -14,8 +14,10 @@ import aiohttp
 import json
 import asyncio
 import re
+import html
+import traceback
 from datetime import datetime
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Any
 from urllib.parse import quote_plus
 import os
 from dotenv import load_dotenv
@@ -181,13 +183,14 @@ class EventManager:
                         # Extract question/title
                         title_match = re.search(r'<title>([^<]+)</title>', html)
                         if title_match:
-                            question = title_match.group(1).split('|')[0].split('-')[0].strip()
+                            raw_title = title_match.group(1).split('|')[0].split('-')[0].strip()
+                            question = self._clean_html_fragment(raw_title)
                         
                         # Look for question in h1 or main heading
                         if not question:
                             h1_match = re.search(r'<h1[^>]*>([^<]+)</h1>', html)
                             if h1_match:
-                                question = h1_match.group(1).strip()
+                                question = self._clean_html_fragment(h1_match.group(1))
                         
                         # Extract rules - look for "Rules" section
                         rules_patterns = [
@@ -198,7 +201,7 @@ class EventManager:
                         for pattern in rules_patterns:
                             match = re.search(pattern, html, re.IGNORECASE | re.DOTALL)
                             if match:
-                                rules = match.group(1).strip()[:200]
+                                rules = self._clean_html_fragment(match.group(1))[:200]
                                 break
                         
                         # For multi-option markets, try to extract all outcomes
@@ -335,6 +338,18 @@ class EventManager:
         return None
     
     async def fetch_polymarket_data(self, event_info: Dict[str, str]) -> Optional[Dict]:
+        """Public wrapper that guards Polymarket fetches with fail-safe handling."""
+        event_query = event_info.get('query', '')
+        try:
+            return await self._fetch_polymarket_data_core(event_info)
+        except Exception as exc:
+            print(f"❌ [ERROR] fetch_polymarket_data failed: {type(exc).__name__}: {exc}")
+            traceback.print_exc()
+            fallback = self._create_mock_market_data(event_query or "未知事件")
+            fallback["source"] = "fetch_polymarket_data_error"
+            return self._validate_event_payload(fallback, "fetch_polymarket_data.exception")
+
+    async def _fetch_polymarket_data_core(self, event_info: Dict[str, str]) -> Optional[Dict]:
         """
         Fetch market data from Polymarket API.
         Returns market info including probability, rules, volume, etc.
@@ -563,18 +578,18 @@ class EventManager:
                                                                         except:
                                                                             pass
                                                                 
-                                                                return {
-                                                                    "question": event_title or "从 Event 提取的多选项市场",
-                                                                    "market_prob": round(outcome_list[0]["market_prob"], 2) if outcome_list else None,
-                                                                    "rules": event_detail.get('description', ''),
-                                                                    "volume": int(total_volume),
-                                                                    "days_left": 30,
-                                                                    "trend": "→",
-                                                                    "is_mock": False,
-                                                                    "source": "gamma_api_events",
-                                                                    "is_multi_option": True,
-                                                                    "outcomes": outcome_list
-                                                                }
+                        return self._validate_event_payload({
+                            "question": event_title or "从 Event 提取的多选项市场",
+                            "market_prob": outcome_list[0]["market_prob"] if outcome_list else None,
+                            "rules": event_detail.get('description', ''),
+                            "volume": int(total_volume),
+                            "days_left": 30,
+                            "trend": "→",
+                            "is_mock": False,
+                            "source": "gamma_api_events",
+                            "is_multi_option": True,
+                            "outcomes": outcome_list
+                        }, "fetch_polymarket_data.event_detail_grouped_parent")
                                                             elif len(markets) >= 1:
                                                                 # This code path should rarely be reached now due to is_multi_option_candidate check above
                                                                 # But keep as fallback
@@ -623,18 +638,18 @@ class EventManager:
                                                                         if len(outcome_list) > 2:
                                                                             print(f"✅ Successfully extracted {len(outcome_list)} options from parent event")
                                                                             total_volume = sum(float(m.get('volume', 0)) for m in child_markets)
-                                                                            return {
-                                                                                "question": event_title,
-                                                                                "market_prob": round(outcome_list[0]["market_prob"], 2) if outcome_list else 0.0,
-                                                                                "rules": event_detail.get('description', ''),
-                                                                                "volume": int(total_volume),
-                                                                                "days_left": 30,
-                                                                                "trend": "→",
-                                                                                "is_mock": False,
-                                                                                "source": "gamma_api_parent_event_direct",
-                                                                                "is_multi_option": True,
-                                                                                "outcomes": outcome_list
-                                                                            }
+                                    return self._validate_event_payload({
+                                        "question": event_title,
+                                        "market_prob": outcome_list[0]["market_prob"] if outcome_list else 0.0,
+                                        "rules": event_detail.get('description', ''),
+                                        "volume": int(total_volume),
+                                        "days_left": 30,
+                                        "trend": "→",
+                                        "is_mock": False,
+                                        "source": "gamma_api_parent_event_direct",
+                                        "is_multi_option": True,
+                                        "outcomes": outcome_list
+                                    }, "fetch_polymarket_data.parent_event_direct")
                                                                 
                                                                 # Try to get outcomes directly from markets if available
                                                                 # Some markets might have outcomes array directly
@@ -694,18 +709,18 @@ class EventManager:
                                                                                     total_volume += float(vol)
                                                                                 except:
                                                                                     pass
-                                                                        return {
-                                                                            "question": event_title or "从 Event 提取的多选项市场",
-                                                                            "market_prob": round(outcome_list[0]["market_prob"], 2) if outcome_list else None,
-                                                                            "rules": event_detail.get('description', ''),
-                                                                            "volume": int(total_volume),
-                                                                            "days_left": 30,
-                                                                            "trend": "→",
-                                                                            "is_mock": False,
-                                                                            "source": "gamma_api_events",
-                                                                            "is_multi_option": True,
-                                                                            "outcomes": outcome_list
-                                                                        }
+                                return self._validate_event_payload({
+                                    "question": event_title or "从 Event 提取的多选项市场",
+                                    "market_prob": outcome_list[0]["market_prob"] if outcome_list else None,
+                                    "rules": event_detail.get('description', ''),
+                                    "volume": int(total_volume),
+                                    "days_left": 30,
+                                    "trend": "→",
+                                    "is_mock": False,
+                                    "source": "gamma_api_events",
+                                    "is_multi_option": True,
+                                    "outcomes": outcome_list
+                                }, "fetch_polymarket_data.event_detail_default")
                                                                 
                                                                 # Fallback: use first market if not enough options extracted
                                                                 market = markets[0]
@@ -761,18 +776,18 @@ class EventManager:
                                                                         if len(outcome_list) > 2:
                                                                             print(f"✅ 从父事件提取了 {len(outcome_list)} 个子选项")
                                                                             total_volume = sum(float(m.get('volume', 0)) for m in child_markets)
-                                                                            return {
-                                                                                "question": parent_title,
-                                                                                "market_prob": round(outcome_list[0]["market_prob"], 2) if outcome_list else 0.0,
-                                                                                "rules": result.get('rules', ''),
-                                                                                "volume": int(total_volume),
-                                                                                "days_left": 30,
-                                                                                "trend": "→",
-                                                                                "is_mock": False,
-                                                                                "source": "gamma_api_parent_event",
-                                                                                "is_multi_option": True,
-                                                                                "outcomes": outcome_list
-                                                                            }
+                                    return self._validate_event_payload({
+                                        "question": parent_title,
+                                        "market_prob": outcome_list[0]["market_prob"] if outcome_list else 0.0,
+                                        "rules": result.get('rules', ''),
+                                        "volume": int(total_volume),
+                                        "days_left": 30,
+                                        "trend": "→",
+                                        "is_mock": False,
+                                        "source": "gamma_api_parent_event",
+                                        "is_multi_option": True,
+                                        "outcomes": outcome_list
+                                    }, "fetch_polymarket_data.parent_event")
                                                                 
                                                                 return result
                                         except asyncio.TimeoutError:
@@ -829,18 +844,18 @@ class EventManager:
                                                     if len(outcome_list) > 2:
                                                         print(f"✅ Timeout fallback 提取了 {len(outcome_list)} 个子选项")
                                                         total_volume = sum(float(m.get('volume', 0)) for m in child_markets)
-                                                        return {
-                                                            "question": parent_title,
-                                                            "market_prob": round(outcome_list[0]["market_prob"], 2) if outcome_list else 0.0,
-                                                            "rules": result.get('rules', ''),
-                                                            "volume": int(total_volume),
-                                                            "days_left": 30,
-                                                            "trend": "→",
-                                                            "is_mock": False,
-                                                            "source": "gamma_api_parent_event_timeout",
-                                                            "is_multi_option": True,
-                                                            "outcomes": outcome_list
-                                                        }
+                    return self._validate_event_payload({
+                        "question": parent_title,
+                        "market_prob": outcome_list[0]["market_prob"] if outcome_list else 0.0,
+                        "rules": result.get('rules', ''),
+                        "volume": int(total_volume),
+                        "days_left": 30,
+                        "trend": "→",
+                        "is_mock": False,
+                        "source": "gamma_api_parent_event_timeout",
+                        "is_multi_option": True,
+                        "outcomes": outcome_list
+                    }, "fetch_polymarket_data.parent_event_timeout")
                                             
                                             return result
                                     # Fallback: use event data directly
@@ -885,18 +900,18 @@ class EventManager:
                                             if len(outcome_list) > 2:
                                                 print(f"✅ Final fallback 提取了 {len(outcome_list)} 个子选项")
                                                 total_volume = sum(float(m.get('volume', 0)) for m in child_markets)
-                                                return {
-                                                    "question": parent_title,
-                                                    "market_prob": round(outcome_list[0]["market_prob"], 2) if outcome_list else 0.0,
-                                                    "rules": result.get('rules', ''),
-                                                    "volume": int(total_volume),
-                                                    "days_left": 30,
-                                                    "trend": "→",
-                                                    "is_mock": False,
-                                                    "source": "gamma_api_parent_event_final",
-                                                    "is_multi_option": True,
-                                                    "outcomes": outcome_list
-                                                }
+                        return self._validate_event_payload({
+                            "question": parent_title,
+                            "market_prob": outcome_list[0]["market_prob"] if outcome_list else 0.0,
+                            "rules": result.get('rules', ''),
+                            "volume": int(total_volume),
+                            "days_left": 30,
+                            "trend": "→",
+                            "is_mock": False,
+                            "source": "gamma_api_parent_event_final",
+                            "is_multi_option": True,
+                            "outcomes": outcome_list
+                        }, "fetch_polymarket_data.parent_event_final")
                                     
                                     return result
                                 # If matched_event is None after all checks, break out to try next method
@@ -1212,18 +1227,18 @@ class EventManager:
                                                                         except:
                                                                             pass
                                                                 
-                                                                return {
-                                                                    "question": event_title_final or "从 Event 提取的多选项市场",
-                                                                    "market_prob": round(outcome_list[0]["market_prob"], 2) if outcome_list else None,
-                                                                    "rules": event_detail.get('description', ''),
-                                                                    "volume": int(total_volume),
-                                                                    "days_left": 30,
-                                                                    "trend": "→",
-                                                                    "is_mock": False,
-                                                                    "source": "gamma_api_events",
-                                                                    "is_multi_option": True,
-                                                                    "outcomes": outcome_list
-                                                                }
+                        return self._validate_event_payload({
+                            "question": event_title_final or "从 Event 提取的多选项市场",
+                            "market_prob": outcome_list[0]["market_prob"] if outcome_list else None,
+                            "rules": event_detail.get('description', ''),
+                            "volume": int(total_volume),
+                            "days_left": 30,
+                            "trend": "→",
+                            "is_mock": False,
+                            "source": "gamma_api_events",
+                            "is_multi_option": True,
+                            "outcomes": outcome_list
+                        }, "fetch_polymarket_data.event_title_final")
                                                             elif len(markets) > 0:
                                                                 market = markets[0]
                                                                 return self._parse_rest_market_data(market)
@@ -1658,12 +1673,13 @@ class EventManager:
             else:
                 question = "未知市场"
         
+        question = self._clean_html_fragment(question)
         # Check if this is a parent event with placeholder
         if fetch_children and self._is_parent_event_title(question):
             print(f"🔍 检测到父事件标题（包含占位符）: {question}")
             # This is a parent event, should not be treated as a single market
             # Return a special marker to indicate we need to fetch children
-            return {
+            parent_payload = {
                 "_is_parent_event": True,
                 "_parent_id": market.get("id"),
                 "_parent_title": question,
@@ -1676,6 +1692,7 @@ class EventManager:
                 "is_mock": False,
                 "source": "parent_event_detected"
             }
+            return self._validate_event_payload(parent_payload, "rest_api_parent_event")
         
         end_date_str = market.get("endDate") or market.get("endDateIso")
         days_left = self._calculate_days_left(end_date_str) if end_date_str else 30
@@ -1759,12 +1776,13 @@ class EventManager:
                 
                 # Only add if probability is positive (or if we want to include all options)
                 # For now, include all options even if prob is 0, as market might have updated
+                clean_name = self._clean_html_fragment(outcome_name)
                 outcome_list.append({
-                    "name": outcome_name.strip(),  # Clean whitespace
+                    "name": clean_name,  # Clean whitespace and invalid chars
                     "probability": round(prob, 2),
                     "market_prob": round(prob, 2)
                 })
-                print(f"   ✅ 选项 {i+1}: {outcome_name.strip()} = {round(prob, 2)}%")
+                print(f"   ✅ 选项 {i+1}: {clean_name} = {round(prob, 2)}%")
         
         print(f"📋 最终解析到 {len(outcome_list)} 个有效选项")
         
@@ -1829,9 +1847,10 @@ class EventManager:
         if len(rules) > 200:
             rules = rules[:197] + "..."
         
+        rules = self._clean_html_fragment(rules or "")
         result = {
             "question": question,
-            "market_prob": round(market_prob, 2),
+            "market_prob": market_prob,
             "rules": rules,
             "volume": volume if volume > 0 else liquidity,
             "days_left": days_left,
@@ -1848,7 +1867,7 @@ class EventManager:
         else:
             result["is_multi_option"] = False
         
-        return result
+        return self._validate_event_payload(result, "rest_api_market")
     
     def _parse_market_data(self, market: Dict) -> Dict:
         """Parse market data from Polymarket API response (GraphQL/legacy)."""
@@ -1868,19 +1887,22 @@ class EventManager:
         end_date_str = market.get("endDate")
         days_left = self._calculate_days_left(end_date_str) if end_date_str else 30
         
-        return {
-            "question": market.get("question", "") or "Unknown Market",
-            "market_prob": round(market_prob, 2) if market_prob is not None else None,
+        question = self._clean_html_fragment(market.get("question", "") or "Unknown Market")
+        result = {
+            "question": question,
+            "market_prob": market_prob,
             "rules": market.get("rules", "No rules specified."),
             "volume": market.get("volume", 0),
             "days_left": days_left,
             "trend": "→",
             "is_mock": False
         }
+        
+        return self._validate_event_payload(result, "graphql_market")
     
     def _create_mock_market_data(self, event_query: str) -> Dict:
         """Create mock market data when API fails or no market found."""
-        return {
+        mock_payload = {
             "question": event_query,
             "market_prob": None,  # No default value
             "rules": "⚠️ 未在 Polymarket 找到对应市场。\n\n这可能是因为：\n1. Polymarket 上暂时没有这个市场\n2. 市场名称不匹配\n\n系统将仅使用 AI 模型进行预测（不使用市场数据）。",
@@ -1889,7 +1911,79 @@ class EventManager:
             "trend": "→",
             "is_mock": True
         }
+        return self._validate_event_payload(mock_payload, "mock_market")
     
+    def _clean_html_fragment(self, text: Optional[str]) -> str:
+        """Remove HTML tags, invisible chars, and normalize whitespace."""
+        if not text:
+            return ""
+        cleaned = html.unescape(text)
+        cleaned = re.sub(r'<[^>]+>', ' ', cleaned)
+        cleaned = re.sub(r'[\u200b-\u200f\u202a-\u202e\ufeff]', '', cleaned)
+        cleaned = cleaned.replace('&nbsp;', ' ')
+        cleaned = re.sub(r'\s+', ' ', cleaned)
+        return cleaned.strip()
+
+    def _sanitize_probability(self, value: Optional[Any], context: str) -> Optional[float]:
+        """Clamp probability values within 0-100 range."""
+        if value is None:
+            return None
+        try:
+            prob = float(value)
+        except (TypeError, ValueError):
+            print(f"⚠️ [DATA] {context}: 无效的概率值 -> {value}")
+            return None
+        if prob < 0 or prob > 100:
+            print(f"⚠️ [DATA] {context}: market_prob 超出范围 ({prob})，将裁剪到 0-100")
+            prob = min(100.0, max(0.0, prob))
+        return round(prob, 2)
+
+    def _sanitize_days_left(self, value: Optional[Any], context: str) -> int:
+        """Ensure days_to_resolution is non-negative."""
+        if value is None:
+            print(f"⚠️ [DATA] {context}: days_to_resolution 缺失，使用 0")
+            return 0
+        try:
+            days = int(value)
+        except (TypeError, ValueError):
+            print(f"⚠️ [DATA] {context}: 无效的 days_to_resolution -> {value}，使用 0")
+            return 0
+        if days < 0:
+            print(f"⚠️ [DATA] {context}: days_to_resolution 为负数 ({days})，已重置为 0")
+            return 0
+        return days
+
+    def _validate_event_payload(self, payload: Optional[Dict[str, Any]], context: str) -> Optional[Dict[str, Any]]:
+        """Apply probability/day validations and clean text fields."""
+        if not isinstance(payload, dict):
+            return payload
+        if "market_prob" in payload:
+            payload["market_prob"] = self._sanitize_probability(payload.get("market_prob"), f"{context}.market_prob")
+        if "days_left" in payload:
+            payload["days_left"] = self._sanitize_days_left(payload.get("days_left"), f"{context}.days_left")
+        if "question" in payload and isinstance(payload["question"], str):
+            payload["question"] = self._clean_html_fragment(payload["question"])
+        if "rules" in payload and isinstance(payload["rules"], str):
+            payload["rules"] = self._clean_html_fragment(payload["rules"])
+        outcomes = payload.get("outcomes")
+        if isinstance(outcomes, list):
+            for outcome in outcomes:
+                if not isinstance(outcome, dict):
+                    continue
+                if "name" in outcome and isinstance(outcome["name"], str):
+                    outcome["name"] = self._clean_html_fragment(outcome["name"])
+                if "market_prob" in outcome:
+                    outcome["market_prob"] = self._sanitize_probability(
+                        outcome.get("market_prob"),
+                        f"{context}.outcome.{outcome.get('name', 'unknown')}.market_prob"
+                    )
+                if "probability" in outcome:
+                    outcome["probability"] = self._sanitize_probability(
+                        outcome.get("probability"),
+                        f"{context}.outcome.{outcome.get('name', 'unknown')}.probability"
+                    ) or 0.0
+        return payload
+
     def _calculate_days_left(self, end_date_str: str) -> int:
         """Calculate days until market resolution."""
         try:
@@ -1897,6 +1991,7 @@ class EventManager:
             end_date = datetime.fromisoformat(end_date_str.replace('Z', '+00:00'))
             now = datetime.now(end_date.tzinfo) if end_date.tzinfo else datetime.now()
             delta = end_date - now
-            return max(0, delta.days)
-        except Exception:
-            return 30  # Default to 30 days
+            return self._sanitize_days_left(delta.days, "calculate_days_left")
+        except Exception as exc:
+            print(f"⚠️ Failed to parse end date '{end_date_str}': {exc}")
+            return self._sanitize_days_left(30, "calculate_days_left_fallback")

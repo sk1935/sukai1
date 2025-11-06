@@ -88,6 +88,7 @@ class OutputFormatter:
                 changed = True
         if changed and cleaned != original:
             print(f"[CLEANUP] Removed JSON artifacts ({context})")
+        cleaned = re.sub(r'[_*\[\]\(\)]', '', cleaned)
         return cleaned
 
     @staticmethod
@@ -112,16 +113,9 @@ class OutputFormatter:
         signal = (data.get("signal") or "HOLD").upper()
         icon = OutputFormatter._trade_signal_icon(signal)
 
-        def _fmt(value: Optional[float], signed: bool = False) -> str:
-            try:
-                numeric = float(value)
-            except (TypeError, ValueError):
-                return "—"
-            return f"{numeric:+.2f}" if signed else f"{numeric:.2f}"
-
-        ev_display = _fmt(data.get("ev"), signed=True)
-        annualized_display = _fmt(data.get("annualized_ev"), signed=True)
-        risk_display = _fmt(data.get("risk_factor"))
+        ev_display = OutputFormatter._fmt_percent(data.get("ev"), signed=True)
+        annualized_display = OutputFormatter._fmt_percent(data.get("annualized_ev"), signed=True)
+        risk_display = OutputFormatter._fmt_number(data.get("risk_factor"))
         reason_text = OutputFormatter.safe_markdown_text(str(data.get("signal_reason", "")).strip()[:200])
 
         # [FIX] Include option context when available so users know which outcome the signal targets.
@@ -135,6 +129,73 @@ class OutputFormatter:
             f"[TRADE_SIGNAL] banner signal={signal} ev={ev_display} "
             f"annualized={annualized_display} risk={risk_display}"
         )
+        return banner
+    
+    def _build_trade_signal_explanation(
+        self,
+        trade_data: Dict,
+        fusion_result: Optional[Dict],
+        event_data: Optional[Dict]
+    ) -> str:
+        basis_parts: List[str] = []
+        fusion_result = fusion_result or {}
+        event_data = event_data or {}
+        model_prob = fusion_result.get("model_only_prob")
+        final_prob = fusion_result.get("final_prob")
+        market_prob = event_data.get("market_prob")
+        if model_prob is not None:
+            basis_parts.append(f"AI共识 {self._fmt_percent(model_prob)}")
+        if final_prob is not None:
+            basis_parts.append(f"融合后 {self._fmt_percent(final_prob)}")
+        if market_prob is not None:
+            basis_parts.append(f"市场隐含 {self._fmt_percent(market_prob)}")
+        if model_prob is not None and market_prob is not None:
+            diff = model_prob - market_prob
+            basis_parts.append(f"差值 {self._fmt_percent(diff, signed=True)}")
+        weights = fusion_result.get("fusion_weights") or {}
+        if weights:
+            model_weight = weights.get("model_weight")
+            market_weight = weights.get("market_weight")
+            if model_weight is not None and market_weight is not None:
+                basis_parts.append(
+                    f"权重 AI {self._fmt_percent(model_weight * 100)} / 市场 {self._fmt_percent(market_weight * 100)}"
+                )
+        conf_factor = fusion_result.get("model_confidence_factor")
+        if conf_factor is not None:
+            basis_parts.append(f"模型信心因子 {self._fmt_number(conf_factor)}")
+        full_analysis = event_data.get("full_analysis") or {}
+        sentiment_trend = full_analysis.get("sentiment_trend")
+        sentiment_score = full_analysis.get("sentiment_score")
+        if sentiment_trend:
+            score_str = self._fmt_number(sentiment_score, signed=True)
+            basis_parts.append(f"舆情 {sentiment_trend} (score {score_str})")
+        threshold = trade_data.get("edge_threshold")
+        if threshold is not None:
+            basis_parts.append(f"触发阈值 {self._fmt_percent(threshold * 100)}")
+        slippage_fee = trade_data.get("slippage_fee")
+        if slippage_fee is not None:
+            basis_parts.append(f"成本假设 {self._fmt_percent(slippage_fee * 100)}")
+        explanation_lines = []
+        if basis_parts:
+            explanation_lines.append("🧾 *信号依据:* " + "; ".join(basis_parts))
+        return "\n".join(explanation_lines)
+
+    def _render_trade_signal_section(
+        self,
+        trade_data: Optional[Dict],
+        fusion_result: Optional[Dict],
+        event_data: Optional[Dict]
+    ) -> str:
+        banner = self._build_trade_signal_banner(trade_data)
+        if not banner:
+            return "⚠️ *交易信号:* 暂无信号（数据不足或模型未触发）"
+        explanation = self._build_trade_signal_explanation(
+            self._extract_trade_signal_data(trade_data),
+            fusion_result,
+            event_data
+        )
+        if explanation:
+            return f"{banner}\n{explanation}"
         return banner
 
 
@@ -226,6 +287,22 @@ class OutputFormatter:
         for char in escape_chars:
             escaped = escaped.replace(char, f'\\{char}')
         return escaped
+    
+    @staticmethod
+    def _fmt_number(value: Optional[float], decimals: int = 2, signed: bool = False, default: str = "—") -> str:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return default
+        fmt = f"{{:+.{decimals}f}}" if signed else f"{{:.{decimals}f}}"
+        return fmt.format(numeric)
+    
+    @staticmethod
+    def _fmt_percent(value: Optional[float], signed: bool = False, default: str = "—") -> str:
+        formatted = OutputFormatter._fmt_number(value, decimals=2, signed=signed, default=default)
+        if formatted == default:
+            return default
+        return f"{formatted}%"
     
     @staticmethod
     def safe_markdown_text(text: str, max_length: int = None) -> str:
@@ -430,15 +507,10 @@ class OutputFormatter:
                         print(f"[WARNING] 检测到异常 AI 预测值：{name} = {ai_prob_val}%，可能存在归一化错误")
                     
                     if has_ai:
-                        # 【修复】转义 "<0" 为 "\\<0%"
-                        ai_prob_str = f"{ai_prob_val:.1f}%"
-                        if ai_prob_str.startswith("<0"):
-                            ai_prob_str = "\\<0%"
-                        elif "<0" in ai_prob_str:
-                            ai_prob_str = ai_prob_str.replace("<0", "\\<0")
-                        
+                        ai_prob_str = self._fmt_percent(ai_prob_val)
+                        market_prob_str = self._fmt_percent(market_prob_val)
                         output += f"• *{name_escaped}*\n"
-                        output += f"  AI预测: {ai_prob_str} | 市场: {market_prob_val:.1f}%"
+                        output += f"  AI预测: {ai_prob_str} | 市场: {market_prob_str}"
                         
                         # 计算偏差（使用归一化后的AI概率）
                         diff = ai_prob_val - market_prob_val
@@ -447,21 +519,22 @@ class OutputFormatter:
                             print("⚙️ [SAFE] 修复空值保护: diff")
                             diff = 0.0
                         if abs(diff) > 5:
+                            diff_display = self._fmt_percent(abs(diff))
                             if diff > 0:
-                                output += f" \\(AI看好 \\+{abs(diff or 0.0):.1f}%\\)"
+                                output += f" \\(AI看好 \\+{diff_display}\\)"
                             else:
-                                output += f" \\(市场看好 \\+{abs(diff or 0.0):.1f}%\\)"
+                                output += f" \\(市场看好 \\+{diff_display}\\)"
                         output += "\n\n"
                     else:
                         # 只有市场价格
                         output += f"• *{name_escaped}*\n"
-                        output += f"  市场: {market_prob_val:.1f}%\n\n"
+                        output += f"  市场: {self._fmt_percent(market_prob_val)}\n\n"
                 except (TypeError, ValueError) as e:
                     print(f"⚠️ 选项 {name} 的数据格式错误（ai_prob: {ai_prob}, market_prob: {market_prob}），跳过格式化: {e}")
                     try:
                         market_prob_val = float(market_prob) if market_prob is not None else 0.0
                         output += f"• *{name_escaped}*\n"
-                        output += f"  市场: {market_prob_val:.1f}%\n\n"
+                        output += f"  市场: {self._fmt_percent(market_prob_val)}\n\n"
                     except (TypeError, ValueError):
                         output += f"• *{name_escaped}*\n"
                         output += f"  市场: N/A\n\n"
@@ -471,7 +544,7 @@ class OutputFormatter:
                 try:
                     market_prob_val = float(market_prob) if market_prob is not None else 0.0
                     output += f"• *{name_escaped}*\n"
-                    output += f"  市场: {market_prob_val:.1f}%\n\n"
+                    output += f"  市场: {self._fmt_percent(market_prob_val)}\n\n"
                 except (TypeError, ValueError):
                     output += f"• *{name_escaped}*\n"
                     output += f"  市场: N/A\n\n"
@@ -513,17 +586,19 @@ class OutputFormatter:
                 print("⚙️ [SAFE] 修复空值保护: market_prob (significant_deviations)")
                 market_prob = 0.0
             diff = (ai_prob or 0.0) - (market_prob or 0.0)
-            diff = diff or 0.0
             if diff is None:
                 print("⚙️ [SAFE] 修复空值保护: diff (significant_deviations)")
                 diff = 0.0
-            
             if abs(diff) > 8:
                 name_escaped = self.safe_markdown_text(name)
                 if diff > 0:
-                    significant_deviations.append(f"• \"{name_escaped}\" AI高估 \\(\\+{abs(diff or 0.0):.1f}%\\)")
+                    significant_deviations.append(
+                        f"• \"{name_escaped}\" AI高估 \\(\\+{self._fmt_percent(abs(diff))}\\)"
+                    )
                 else:
-                    significant_deviations.append(f"• \"{name_escaped}\" 市场高估 \\(\\+{abs(diff or 0.0):.1f}%\\)")
+                    significant_deviations.append(
+                        f"• \"{name_escaped}\" 市场高估 \\(\\+{self._fmt_percent(abs(diff))}\\)"
+                    )
         
         if significant_deviations:
             output += "\n".join(significant_deviations) + "\n\n"
@@ -608,9 +683,9 @@ class OutputFormatter:
                 ai_total = 0.0
             output += f"📊 *AI预测总和：* {(ai_total or 0.0):.2f}%\n"
 
-        trade_banner = self._build_trade_signal_banner(trade_signal)
-        if trade_banner:
-            output += "\n" + trade_banner
+        trade_section = self._render_trade_signal_section(trade_signal, fusion_result, event_data)
+        if trade_section:
+            output += "\n" + trade_section
         
         return output
     
@@ -674,6 +749,8 @@ class OutputFormatter:
             print("⚙️ [SAFE] 修复空值保护: final_prob (format_prediction)")
             final_prob = 0.0
         
+        from src.fusion_engine import FusionEngine
+
         # Determine if we have valid AI prediction
         has_ai_prediction = False
         if model_only_prob is not None:
@@ -681,7 +758,6 @@ class OutputFormatter:
             has_ai_prediction = True
         elif model_count > 0 and final_prob > 0:
             # Try to reverse calculate only if we have model responses
-            from src.fusion_engine import FusionEngine
             try:
                 model_only_prob = (final_prob - FusionEngine.MARKET_WEIGHT * market_prob) / FusionEngine.MODEL_WEIGHT
                 # Validate the result makes sense
@@ -709,7 +785,10 @@ class OutputFormatter:
             try:
                 model_only_prob_val = float(model_only_prob)
                 uncertainty_val = float(fusion_result.get('uncertainty', 0)) if fusion_result.get('uncertainty') is not None else 0.0
-                ai_prediction_line = f"🤖 *纯AI预测:* {model_only_prob_val:.1f}% ± {uncertainty_val:.1f}%"
+                ai_prediction_line = (
+                    f"🤖 *纯AI预测:* {self._fmt_percent(model_only_prob_val)} ± "
+                    f"{self._fmt_percent(uncertainty_val)}"
+                )
             except (TypeError, ValueError):
                 print("⚠️ model_only_prob 数据格式错误，跳过格式化")
                 ai_prediction_line = f"🤖 *纯AI预测:* 暂不可用 (数据格式错误)"
@@ -784,10 +863,11 @@ class OutputFormatter:
                 print("⚠️ sentiment_score is None, using default 0.0")
                 sentiment_score = 0.0
             
+            sentiment_score_str = self._fmt_number(sentiment_score, signed=True)
             analysis_lines = [
                 f"🧭 *事件类别:* {category_cn}",
                 f"📈 *市场趋势:* {full_analysis.get('market_trend', '数据不足，无法计算')}",
-                f"📰 *舆情趋势:* {sentiment_cn} ({(sentiment_score or 0.0):+.2f})，"
+                f"📰 *舆情趋势:* {sentiment_cn} ({sentiment_score_str})，"
                 f"样本：{sentiment_sample} 篇{sample_hint}（来源：{full_analysis.get('sentiment_source', '未知')}）",
                 f"📜 *规则摘要:* {self.safe_markdown_text(full_analysis.get('rules_summary', '无规则信息'))}"
             ]
@@ -917,18 +997,26 @@ class OutputFormatter:
         demarket_note = ""
         if fusion_result.get("demarket_applied"):
             demarket_note = f"\n💡 {fusion_result.get('demarket_note', 'Applied de-marketization penalty.')}\n"
-        
+
+        fusion_weights_info = fusion_result.get("fusion_weights") or {}
+        model_weight_pct = self._fmt_percent((fusion_weights_info.get("model_weight", FusionEngine.MODEL_WEIGHT) or 0) * 100)
+        market_weight_pct = self._fmt_percent((fusion_weights_info.get("market_weight", FusionEngine.MARKET_WEIGHT) or 0) * 100)
+        weight_note = ""
+        if model_weight_pct != "—" and market_weight_pct != "—":
+            weight_note = f"（AI权重 {model_weight_pct}, 市场权重 {market_weight_pct}）"
+        market_price_str = self._fmt_percent(market_prob)
+        final_prob_str = self._fmt_percent(final_prob)
         output = f"""📊 *事件:* {question_escaped}
 
 {analysis_section}{ai_prediction_line}
-📈 *市场价格:* {(market_prob or 0.0):.1f}%
-🧠 *融合预测:* {(final_prob or 0.0):.1f}% (80% AI + 20% 市场)
+📈 *市场价格:* {market_price_str}
+🧠 *融合预测:* {final_prob_str} {weight_note}
 {demarket_note}{deepseek_section}{versions_section}{weight_source_section}{evaluation_section}💬 *摘要:* {summary_escaped}
 ⚖️ *分歧程度:* {disagreement_cn}
 📜 *规则:* {rules_escaped}"""
-        trade_banner = self._build_trade_signal_banner(trade_signal)
-        if trade_banner:
-            output += "\n" + trade_banner
+        trade_section = self._render_trade_signal_section(trade_signal, fusion_result, event_data)
+        if trade_section:
+            output += "\n" + trade_section
         
         return output
     
@@ -1078,8 +1166,7 @@ class OutputFormatter:
             if diff is None:
                 print("⚠️ diff is None, using default 0.0")
                 diff = 0.0
-            # Escape + sign in diff_str
-            diff_str = f"{'+' if diff > 0 else ''}{(diff or 0.0):.1f}%"
+            diff_str = self._fmt_percent(diff, signed=True)
             
             # Emoji indicator
             if i == 1:
@@ -1140,12 +1227,6 @@ class OutputFormatter:
                 has_meaningful_summary         # Has real content
             )
             
-            # Escape parentheses in diff_str to prevent Markdown parsing errors
-            # Note: diff_str format is like "+1.5%" or "-2.3%", which may contain special chars
-            # 【修复】类型安全检查：确保 diff_str 是字符串类型
-            if not isinstance(diff_str, str):
-                diff_str = str(diff_str)
-                print(f"[SAFE_REPLACE] Converted diff_str to str before replace() in output_formatter.py:1090")
             diff_str_escaped = diff_str.replace('(', '\\(').replace(')', '\\)')
             
             # Format the option line carefully
@@ -1168,16 +1249,13 @@ class OutputFormatter:
                 if market is None:
                     print(f"⚠️ market is None for {name}, using default 0.0")
                     market = 0.0
-                # 【修复】转义 "<0" 为 "\\<0%"
-                ai_display_str = f"{(ai_display or 0.0):.1f}%"
-                if ai_display_str.startswith("<0"):
-                    ai_display_str = "\\<0%"
-                elif "<0" in ai_display_str:
-                    ai_display_str = ai_display_str.replace("<0", "\\<0")
+                ai_display_str = self._fmt_percent(ai_display)
+                uncertainty_str = self._fmt_percent(uncertainty)
+                market_str = self._fmt_percent(market)
                 
                 output += f"""{emoji} *{i}.* {name}
-   🤖 AI预测: {ai_display_str} ± {(uncertainty or 0.0):.1f}%
-   📈 市场价格: {(market or 0.0):.1f}% ({diff_str_escaped})
+   🤖 AI预测: {ai_display_str} ± {uncertainty_str}
+   📈 市场价格: {market_str} ({diff_str_escaped})
    
 """
             else:
@@ -1188,7 +1266,7 @@ class OutputFormatter:
                     print(f"⚠️ market is None for {name}, using default 0.0")
                     market = 0.0
                 output += f"""{emoji} *{i}.* {name}
-   📈 市场价格: {(market or 0.0):.1f}%
+   📈 市场价格: {self._fmt_percent(market)}
    ⚠️ AI预测暂不可用
    
 """
@@ -1208,7 +1286,7 @@ class OutputFormatter:
                 if market_prob is None:
                     print(f"⚠️ market_prob is None for {name_escaped}, using default 0.0")
                     market_prob = 0.0
-                output += f"  • {name_escaped}: {(prediction or 0.0):.1f}% \\(市场: {(market_prob or 0.0):.1f}%\\)\n"
+                output += f"  • {name_escaped}: {self._fmt_percent(prediction)} \\(市场: {self._fmt_percent(market_prob)}\\)\n"
         
         # Add rules if available
         rules = event_data.get("rules", "")
@@ -1292,9 +1370,9 @@ class OutputFormatter:
         
         if combined_sections:
             output = output.rstrip('\n') + combined_sections
-        trade_banner = self._build_trade_signal_banner(trade_signal)
-        if trade_banner:
-            output += "\n" + trade_banner
+        trade_section = self._render_trade_signal_section(trade_signal, fusion_result, event_data)
+        if trade_section:
+            output += "\n" + trade_section
         
         return output
     

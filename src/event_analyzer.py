@@ -9,7 +9,7 @@ import aiohttp
 import asyncio
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Any
 from urllib.parse import quote_plus
 import os
 import sys
@@ -82,17 +82,20 @@ class EventAnalyzer:
         "geopolitics": {
             "keywords": ["election", "president", "russia", "china", "war", "conflict", "ceasefire", 
                         "ukraine", "taiwan", "israel", "palestine", "geopolitical", "jinping", "xi",
-                        "trump", "biden", "leader", "government", "political", "power"],
+                        "trump", "biden", "leader", "government", "political", "power", "senate",
+                        "parliament", "referendum", "coup", "military"],
             "display_name": "地缘政治"
         },
         "economy": {
             "keywords": ["gdp", "inflation", "rate", "fed", "unemployment", "economy", "market", 
-                        "stock", "crypto", "bitcoin", "financial"],
+                        "stock", "crypto", "bitcoin", "financial", "treasury", "recession",
+                        "currency", "interest", "bond", "tariff"],
             "display_name": "经济指标"
         },
         "tech": {
             "keywords": ["apple", "google", "gpt", "ai", "gemini", "release", "launch", "product", 
-                        "iphone", "app store", "technology"],
+                        "iphone", "app store", "technology", "nasa", "spacex", "rocket", "chip",
+                        "semiconductor", "cloud", "quantum"],
             "display_name": "科技产品"
         },
         "social": {
@@ -100,8 +103,24 @@ class EventAnalyzer:
             "display_name": "社会事件"
         },
         "sports": {
-            "keywords": ["world cup", "olympics", "championship", "tournament", "nba", "nfl"],
+            "keywords": ["world cup", "olympics", "championship", "tournament", "nba", "nfl",
+                        "fifa", "premier league", "grand slam", "formula 1", "super bowl"],
             "display_name": "体育赛事"
+        },
+        "entertainment": {
+            "keywords": ["movie", "film", "box office", "netflix", "disney", "hollywood",
+                        "oscars", "grammys", "concert", "album", "series", "show"],
+            "display_name": "文娱传媒"
+        },
+        "science": {
+            "keywords": ["space", "mission", "satellite", "telescope", "gene", "vaccine",
+                        "research", "discovery", "experiment", "quantum"],
+            "display_name": "科学探索"
+        },
+        "climate": {
+            "keywords": ["climate", "emission", "carbon", "temperature", "warming", "hurricane",
+                        "wildfire", "flood", "drought", "rainfall"],
+            "display_name": "气候环境"
         }
     }
     
@@ -279,7 +298,11 @@ class EventAnalyzer:
         # 权重已在 _get_sentiment_signal() 中计算，这里不再重复计算
         
         # 4. 规则摘要
-        rules_summary = self._extract_rules_summary(event_rules)
+        rules_summary = self._extract_rules_summary(
+            event_rules,
+            market_prob=market_prob,
+            sentiment_data=sentiment_data
+        )
         
         # 5. 世界温度计算（新增）
         world_temp_data = None
@@ -314,39 +337,45 @@ class EventAnalyzer:
     
     def _detect_category(self, event_text: str) -> str:
         """
-        检测事件类别，优化后的版本，扩展了 geopolitics 类关键词
+        使用分数机制对事件进行分类，可覆盖更多领域（政治、经济、科技、体育、娱乐等）
         """
-        event_text = event_text.lower()
+        if not event_text:
+            return "general"
         
-        categories = {
-            "geopolitics": [
-                "war", "conflict", "invasion", "president", "election",
-                "government", "military", "coup", "regime", "dictator",
-                "venezuela", "maduro", "putin", "xi jinping", "biden",
-                "sanction", "parliament"
-            ],
-            "economy": [
-                "gdp", "inflation", "unemployment", "rate", "market",
-                "recession", "interest", "fed", "stocks", "bond"
-            ],
-            "tech": [
-                "launch", "release", "product", "ai", "openai", "gemini",
-                "gpt", "apple", "tesla", "meta", "chip"
-            ],
-            "social": [
-                "disaster", "pandemic", "health", "disease", "education",
-                "crime", "migration", "protest"
-            ],
-            "sports": [
-                "world cup", "olympics", "championship", "tournament"
-            ],
-        }
+        normalized = event_text.lower()
+        tokens = set(re.findall(r"[a-z0-9']+", normalized))
+        category_scores: Dict[str, int] = {}
         
-        for category, keywords in categories.items():
-            if any(k in event_text for k in keywords):
-                return category
+        for category_id, cfg in self.EVENT_CATEGORIES.items():
+            score = 0
+            for keyword in cfg.get("keywords", []):
+                keyword_lower = keyword.lower()
+                if " " in keyword_lower:
+                    if keyword_lower in normalized:
+                        score += len(keyword_lower.split()) + 1
+                else:
+                    if keyword_lower in tokens:
+                        score += 1
+            category_scores[category_id] = score
         
-        return "general"
+        # 额外启发式：检测 “vs”/“vs.”/“@” 模式，多用于体育赛事
+        if re.search(r"\b(vs\.?|vs|@)\b", normalized):
+            category_scores["sports"] = category_scores.get("sports", 0) + 2
+        # 金融/加密资产的补充判断
+        if re.search(r"\b(bitcoin|ethereum|crypto|token)\b", normalized):
+            category_scores["economy"] = category_scores.get("economy", 0) + 2
+        # 娱乐圈常见词
+        if re.search(r"\b(oscars?|grammys?|box office|streaming)\b", normalized):
+            category_scores["entertainment"] = category_scores.get("entertainment", 0) + 2
+        
+        top_category = "general"
+        top_score = 0
+        for cat, score in category_scores.items():
+            if score > top_score:
+                top_category = cat
+                top_score = score
+        
+        return top_category if top_score > 0 else "general"
     
     def _get_category_display_name(self, category_id: str) -> str:
         """获取类别显示名称"""
@@ -420,9 +449,9 @@ class EventAnalyzer:
         API_TIMEOUT = 8  # 每个API最多等待8秒
         
         # 按优先级尝试各个API（快速失败机制）
-        async def fetch_with_timeout(source_name: str, coro):
+        async def run_source(source_name: str, fetcher):
             try:
-                data = await asyncio.wait_for(coro, timeout=API_TIMEOUT)
+                data = await asyncio.wait_for(fetcher(), timeout=API_TIMEOUT)
                 return source_name, data
             except asyncio.TimeoutError:
                 print(f"⏱️ [WARNING] {source_name.upper()} API 超时（>{API_TIMEOUT}s），跳过")
@@ -434,22 +463,26 @@ class EventAnalyzer:
         source_results = {}
         tasks = []
         # Always attempt GDELT
-        tasks.append(fetch_with_timeout("gdelt", self._fetch_gdelt_sentiment(keyword_str)))
+        tasks.append(run_source("gdelt", lambda: self._fetch_gdelt_sentiment(keyword_str)))
         
         # Conditionally schedule NewsAPI / Mediastack based on rate limits
         newsapi_allowed = self._check_rate_limit("newsapi")
         mediastack_allowed = self._check_rate_limit("mediastack")
         if newsapi_allowed:
-            tasks.append(fetch_with_timeout("newsapi", self._fetch_newsapi_sentiment(keyword_str)))
+            tasks.append(run_source("newsapi", lambda: self._fetch_newsapi_sentiment(keyword_str)))
         else:
             source_results["newsapi"] = None
         if mediastack_allowed:
-            tasks.append(fetch_with_timeout("mediastack", self._fetch_mediastack_sentiment(keyword_str)))
+            tasks.append(run_source("mediastack", lambda: self._fetch_mediastack_sentiment(keyword_str)))
         else:
             source_results["mediastack"] = None
         
-        fetched = await asyncio.gather(*tasks, return_exceptions=False)
-        for source_name, data in fetched:
+        fetched = await asyncio.gather(*tasks, return_exceptions=True)
+        for entry in fetched:
+            if isinstance(entry, Exception):
+                print(f"⚠️ [WARNING] 舆情任务异常: {entry}")
+                continue
+            source_name, data = entry
             source_results[source_name] = data
         
         def prepare_result(data: Optional[Dict]) -> Optional[Dict]:
@@ -520,88 +553,91 @@ class EventAnalyzer:
         
         return keywords[:5]  # 返回前5个关键词
     
+    async def _fetch_json_with_retry(
+        self,
+        url: str,
+        source_name: str,
+        timeout: int = 10,
+        attempts: int = 2,
+        headers: Optional[Dict[str, str]] = None
+    ) -> Optional[Dict]:
+        """通用的带重试 JSON 请求"""
+        last_error: Optional[Exception] = None
+        for attempt in range(1, attempts + 1):
+            try:
+                timeout_cfg = aiohttp.ClientTimeout(total=timeout)
+                async with aiohttp.ClientSession(timeout=timeout_cfg) as session:
+                    async with session.get(url, headers=headers) as response:
+                        if response.status == 200:
+                            return await response.json()
+                        last_error = RuntimeError(f"status {response.status}")
+                        print(f"⚠️ [{source_name}] HTTP {response.status} (attempt {attempt}/{attempts})")
+            except Exception as exc:
+                last_error = exc
+                print(f"⚠️ [{source_name}] 请求异常 (attempt {attempt}/{attempts}): {type(exc).__name__}: {exc}")
+            if attempt < attempts:
+                await asyncio.sleep(min(2, attempt * 1.5))
+        if last_error:
+            print(f"❌ [{source_name}] 连续失败（{attempts} 次）：{last_error}")
+        return None
+    
     async def _fetch_gdelt_sentiment(self, keyword: str) -> Optional[Dict]:
         """从GDELT获取舆情"""
-        try:
-            url = f"{self.GDELT_URL}?query={quote_plus(keyword)}&mode=ArtList&format=json&maxrecords=20"
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        articles = data.get("articles", [])
-                        
-                        if len(articles) >= 5:
-                            # 简化：计算平均情感（GDELT可能不直接提供情感分数）
-                            # 这里使用文章数量作为代理指标
-                            score = 0.0  # 默认中性
-                            sentiment = "neutral"
-                            
-                            return {
-                                "sentiment": sentiment,
-                                "score": score,
-                                "sample_count": len(articles),
-                                "source": "GDELT"
-                            }
-        except Exception as e:
-            print(f"⚠️ GDELT API错误: {e}")
+        url = f"{self.GDELT_URL}?query={quote_plus(keyword)}&mode=ArtList&format=json&maxrecords=20"
+        data = await self._fetch_json_with_retry(url, "GDELT", timeout=10, attempts=3)
+        if not data:
+            return None
+        
+        articles = data.get("articles", [])
+        if len(articles) >= 5:
+            score = 0.0  # 默认中性
+            sentiment = "neutral"
+            return {
+                "sentiment": sentiment,
+                "score": score,
+                "sample_count": len(articles),
+                "source": "GDELT"
+            }
         
         return None
     
     async def _fetch_newsapi_sentiment(self, keyword: str) -> Optional[Dict]:
         """从NewsAPI获取舆情"""
-        try:
-            url = f"{self.NEWSAPI_URL}?q={quote_plus(keyword)}&language=en&sortBy=publishedAt&apiKey={self.NEWSAPI_KEY}"
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        articles = data.get("articles", [])
-                        
-                        if articles:
-                            # 简化：计算平均情感（NewsAPI不直接提供情感分数，需要NLP分析）
-                            # 这里使用占位逻辑
-                            score = 0.05  # 示例：轻微正面
-                            sentiment = "neutral"
-                            
-                            return {
-                                "sentiment": sentiment,
-                                "score": score,
-                                "sample_count": len(articles),
-                                "source": "NewsAPI"
-                            }
-                    else:
-                        print(f"⚠️ NewsAPI返回状态码: {response.status}")
-        except Exception as e:
-            print(f"⚠️ NewsAPI错误: {e}")
+        url = f"{self.NEWSAPI_URL}?q={quote_plus(keyword)}&language=en&sortBy=publishedAt&apiKey={self.NEWSAPI_KEY}"
+        data = await self._fetch_json_with_retry(url, "NewsAPI", timeout=10, attempts=3)
+        if not data:
+            return None
+        
+        articles = data.get("articles", [])
+        if articles:
+            score = 0.05  # 示例：轻微正面
+            sentiment = "neutral"
+            return {
+                "sentiment": sentiment,
+                "score": score,
+                "sample_count": len(articles),
+                "source": "NewsAPI"
+            }
         
         return None
     
     async def _fetch_mediastack_sentiment(self, keyword: str) -> Optional[Dict]:
         """从Mediastack获取舆情"""
-        try:
-            url = f"{self.MEDIASTACK_URL}?access_key={self.MEDIASTACK_KEY}&keywords={keyword}&languages=en"
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        articles = data.get("data", [])
-                        
-                        if articles:
-                            # 简化：计算平均情感
-                            score = -0.1  # 示例：轻微负面
-                            sentiment = "neutral"
-                            
-                            return {
-                                "sentiment": sentiment,
-                                "score": score,
-                                "sample_count": len(articles),
-                                "source": "Mediastack"
-                            }
-        except Exception as e:
-            print(f"⚠️ Mediastack错误: {e}")
+        url = f"{self.MEDIASTACK_URL}?access_key={self.MEDIASTACK_KEY}&keywords={keyword}&languages=en"
+        data = await self._fetch_json_with_retry(url, "Mediastack", timeout=10, attempts=3)
+        if not data:
+            return None
+        
+        articles = data.get("data", [])
+        if articles:
+            score = -0.1  # 示例：轻微负面
+            sentiment = "neutral"
+            return {
+                "sentiment": sentiment,
+                "score": score,
+                "sample_count": len(articles),
+                "source": "Mediastack"
+            }
         
         return None
     
@@ -617,7 +653,37 @@ class EventAnalyzer:
         }
         self._save_sentiment_cache()
     
-    def _extract_rules_summary(self, rules: str) -> str:
+    def _build_market_sentiment_hint(
+        self,
+        market_prob: Optional[float],
+        sentiment_data: Optional[Dict[str, Any]]
+    ) -> str:
+        """根据市场概率和舆情信号生成附加提示"""
+        hints: List[str] = []
+        if isinstance(market_prob, (int, float)):
+            distance = abs(50 - market_prob)
+            if distance < 12:
+                hints.append("⚠️ 市场价格接近 50%，多空分歧较大，需要保持审慎。")
+            elif market_prob < 20 or market_prob > 80:
+                hints.append("ℹ️ 市场价格极端，可能存在群体性偏好或波动放大效应。")
+        if sentiment_data:
+            score = sentiment_data.get("score", 0.0) or 0.0
+            sample = sentiment_data.get("sample_count", 0) or 0
+            if sample < 20:
+                hints.append("ℹ️ 舆情样本有限（<20），信号不稳定。")
+            else:
+                if score <= -0.2:
+                    hints.append("📉 舆情显著偏负面，应适度降低模型乐观度。")
+                elif score >= 0.2:
+                    hints.append("📈 舆情偏正面，可参考但仍需验证基本面。")
+        return "\n".join(hints)
+    
+    def _extract_rules_summary(
+        self,
+        rules: str,
+        market_prob: Optional[float] = None,
+        sentiment_data: Optional[Dict[str, Any]] = None
+    ) -> str:
         """
         提取规则摘要，优化版本：提取完整句子
         """
@@ -632,6 +698,9 @@ class EventAnalyzer:
         else:
             summary = rules[:180] + ("..." if len(rules) > 180 else "")
         
+        sentiment_hint = self._build_market_sentiment_hint(market_prob, sentiment_data)
+        if sentiment_hint:
+            summary = f"{summary}\n{sentiment_hint}"
         return summary
     
     # 保留原有的 analyze_event 方法以保持兼容性
@@ -680,6 +749,9 @@ class EventAnalyzer:
             "tech": "科技产品",
             "social": "社会事件",
             "sports": "体育赛事",
+            "entertainment": "文娱传媒",
+            "science": "科学探索",
+            "climate": "气候环境",
             "general": "通用事件"
         }
         chinese_category = category_map.get(category, "通用事件")
@@ -763,6 +835,57 @@ class EventAnalyzer:
                 {
                     "name": "市场情绪分析",
                     "description": "分析市场预期、投资者情绪、情绪驱动的波动",
+                    "model": "grok-4"
+                }
+            ],
+            "文娱传媒": [
+                {
+                    "name": "观众口碑监测",
+                    "description": "追踪媒体评价、社交媒体热度以及粉丝情绪波动",
+                    "model": "grok-4"
+                },
+                {
+                    "name": "票房与收视预测",
+                    "description": "结合历史表现和发行节奏预测票房/收视表现",
+                    "model": "deepseek-chat"
+                },
+                {
+                    "name": "宣发及监管风险",
+                    "description": "识别艺人舆情、监管审查、宣发投入等风险",
+                    "model": "claude-3-7-sonnet-latest"
+                }
+            ],
+            "科学探索": [
+                {
+                    "name": "技术成熟度评估",
+                    "description": "评估科研项目或任务的技术成熟度与实验里程碑",
+                    "model": "gpt-4o"
+                },
+                {
+                    "name": "历史任务比对",
+                    "description": "对比类似科研任务的成功率和失败原因",
+                    "model": "gemini-2.5-pro"
+                },
+                {
+                    "name": "资金/政策风险",
+                    "description": "识别资金中断、政策审查、供应链问题等风险",
+                    "model": "claude-3-7-sonnet-latest"
+                }
+            ],
+            "气候环境": [
+                {
+                    "name": "气候数据分析",
+                    "description": "分析温度、降水、风暴等历史/预测数据",
+                    "model": "deepseek-chat"
+                },
+                {
+                    "name": "政策与监管解析",
+                    "description": "评估碳税、排放限额、国际协定等政策变量",
+                    "model": "gpt-4o"
+                },
+                {
+                    "name": "极端事件风险",
+                    "description": "识别极端天气、自然灾害对事件结果的影响",
                     "model": "grok-4"
                 }
             ],

@@ -67,6 +67,43 @@ class PromptBuilder:
             return f"- Global Sentiment: {world_sentiment_summary}"
         return ""
     
+    def _build_global_sentiment_guidance(self, event_data: Dict) -> str:
+        """根据全球舆情提供对模型的决策提示"""
+        world_temp_data = event_data.get("world_temp_data") or {}
+        description = (event_data.get("world_temp") or event_data.get("world_sentiment_summary") or "").lower()
+        positive = world_temp_data.get("positive")
+        negative = world_temp_data.get("negative")
+        try:
+            positive = int(positive)
+        except (TypeError, ValueError):
+            positive = None
+        try:
+            negative = int(negative)
+        except (TypeError, ValueError):
+            negative = None
+        guidance = ""
+        if isinstance(positive, int) and isinstance(negative, int):
+            if negative > positive * 1.2 and negative - positive >= 5:
+                guidance = (
+                    "- Sentiment Guidance: Global mood is risk-off. "
+                    "请更关注下行风险，谨慎对待过度乐观的推断。"
+                )
+            elif positive > negative * 1.2 and positive - negative >= 5:
+                guidance = (
+                    "- Sentiment Guidance: Global mood is mildly risk-on. "
+                    "可以识别潜在上行机会，但仍需验证逻辑链。"
+                )
+        if not guidance and description:
+            if "negative" in description or "bearish" in description or "偏负" in description:
+                guidance = (
+                    "- Sentiment Guidance: 舆情偏负面，请降低乐观程度并多考虑防御性场景。"
+                )
+            elif "positive" in description or "bullish" in description or "偏正" in description:
+                guidance = (
+                    "- Sentiment Guidance: 舆情偏正面，可在推理中适度考虑有利因素。"
+                )
+        return guidance
+    
     def _build_news_summary_section(self, event_data: Dict) -> str:
         """构建新闻摘要部分（如果可用）"""
         # 优先从 event_data 获取
@@ -104,16 +141,23 @@ class PromptBuilder:
         
         # 构建世界温度和新闻摘要部分
         world_temp_section = self._build_world_temp_section(event_data)
+        global_guidance_section = self._build_global_sentiment_guidance(event_data)
         news_summary_section = self._build_news_summary_section(event_data)
+        
+        if global_guidance_section:
+            world_temp_section = "\n".join(
+                part for part in [world_temp_section, global_guidance_section] if part
+            )
         
         # 【新增】日志输出全球上下文信息
         # 【修复】检查 world_temp 是否为 None 再格式化
         world_temp = event_data.get("world_temp")
-        if world_temp is not None:
-            try:
-                print(f"[PromptBuilder] 🌍 包含世界温度: {float(world_temp):.2f}")
-            except (TypeError, ValueError):
-                print("⚠️ [PromptBuilder] world_temp 数据格式错误，跳过格式化")
+        if world_temp:
+            print(f"[PromptBuilder] 🌍 全球情绪描述: {world_temp}")
+        elif event_data.get("world_sentiment_summary"):
+            print(f"[PromptBuilder] 🌍 全球情绪摘要: {event_data['world_sentiment_summary']}")
+        if global_guidance_section:
+            print("[PromptBuilder] 🎛️ 已根据全球舆情调整推理侧重点")
         if event_data.get("news_summary"):
             print(f"[PromptBuilder] 📰 已注入新闻摘要 ({len(event_data['news_summary'])} 字符)")
         

@@ -39,8 +39,10 @@ class FusionEngine:
         "high": 3.0
     }
     
-    MARKET_WEIGHT = 0.2  # Weight for market probability (降低市场权重)
-    MODEL_WEIGHT = 0.8   # Weight for model consensus (提高模型权重)
+    MARKET_WEIGHT = 0.2  # Legacy default
+    MODEL_WEIGHT = 0.8   # Legacy default
+    MIN_MODEL_WEIGHT = 0.55
+    MAX_MODEL_WEIGHT = 0.9
     
     # Model name mapping: actual model_id -> LMArena config key
     MODEL_NAME_MAPPING = {
@@ -205,6 +207,7 @@ class FusionEngine:
         probabilities: List[float] = []
         weights: List[float] = []
         reasonings = []
+        confidence_factors: List[float] = []
         deepseek_reasoning = None  # Store DeepSeek's reasoning separately
         
         for model_name, result in valid_results.items():
@@ -215,12 +218,18 @@ class FusionEngine:
             # Use LMArena base weight instead of model_weights parameter
             base_weight = self._get_base_weight(model_name)
             confidence_weight = self.CONFIDENCE_WEIGHTS.get(confidence, 2.0)
-            total_weight = self._safe_float(base_weight, 0.0) * self._safe_float(confidence_weight, 0.0)
+            confidence_factor = self._compute_model_confidence_factor(model_name, base_weight, confidence_weight, result)
+            total_weight = (
+                self._safe_float(base_weight, 0.0)
+                * self._safe_float(confidence_weight, 0.0)
+                * (0.5 + confidence_factor / 2)
+            )
             
             probabilities.append(prob)
             weights.append(total_weight)
             # Only add reasoning, not model name
             reasonings.append(reasoning)
+            confidence_factors.append(confidence_factor)
             
             # Extract DeepSeek reasoning separately
             if model_name == "deepseek-chat":
@@ -239,12 +248,19 @@ class FusionEngine:
         
         # Combine with market probability (if market_bias enabled)
         if self._should_use_market_bias():
+            avg_conf_factor = self._mean(confidence_factors) if confidence_factors else 0.5
+            dynamic_model_weight, dynamic_market_weight = self._compute_dynamic_fusion_weights(
+                avg_conf_factor,
+                uncertainty,
+                market_prob
+            )
             final_prob = (
-                self.MODEL_WEIGHT * consensus_weight +
-                self.MARKET_WEIGHT * market_prob
+                dynamic_model_weight * consensus_weight +
+                dynamic_market_weight * market_prob
             )
         else:
-            # If market_bias is disabled, use pure AI consensus
+            dynamic_model_weight = 1.0
+            dynamic_market_weight = 0.0
             final_prob = consensus_weight
         
         # Apply de-marketization penalty (if enabled)
@@ -288,7 +304,12 @@ class FusionEngine:
             "model_count": len(valid_results),
             "deepseek_reasoning": deepseek_reasoning,  # DeepSeek's reasoning for separate display
             "model_versions": self._get_model_versions(valid_results, orchestrator),  # Add model versions info
-            "weight_source": weight_source  # Add weight source info
+            "weight_source": weight_source,  # Add weight source info
+            "model_confidence_factor": round(self._mean(confidence_factors) if confidence_factors else 0.5, 3),
+            "fusion_weights": {
+                "model_weight": round(dynamic_model_weight, 3),
+                "market_weight": round(dynamic_market_weight, 3)
+            }
         }
         
         # Add experiment flags if applicable
@@ -1190,6 +1211,61 @@ class FusionEngine:
         ) / total_weight
         variance = max(variance, 0.0)
         return math.sqrt(variance)
+    
+    def _compute_model_confidence_factor(
+        self,
+        model_name: str,
+        base_weight: float,
+        confidence_weight: float,
+        result: Dict
+    ) -> float:
+        """Combine historical性能 and实时置信度得到模型贡献系数 (0-1)."""
+        max_conf = max(self.CONFIDENCE_WEIGHTS.values())
+        historical_factor = min(1.0, self._safe_float(base_weight, 0.0) / 3.0)
+        realtime_factor = min(1.0, confidence_weight / max_conf if max_conf else 0.0)
+        stability_bonus = 0.05 if result.get("calibration") else 0.0
+        factor = (0.5 * realtime_factor) + (0.4 * historical_factor) + stability_bonus
+        return round(max(0.0, min(1.0, factor)), 4)
+    
+    def _compute_dynamic_fusion_weights(
+        self,
+        avg_conf_factor: float,
+        consensus_uncertainty: float,
+        market_prob: float
+    ) -> Tuple[float, float]:
+        """根据模型置信度和市场波动动态调整 AI/Market 权重。"""
+        volatility_component = self._estimate_market_volatility_component(market_prob)
+        uncertainty_component = min(1.0, self._safe_float(consensus_uncertainty) / 25.0)
+        # 模型权重基础值在 0.55 - 0.9 之间
+        weight = (
+            self.MIN_MODEL_WEIGHT
+            + 0.35 * avg_conf_factor
+            - 0.2 * volatility_component
+            - 0.1 * uncertainty_component
+        )
+        weight = max(self.MIN_MODEL_WEIGHT, min(self.MAX_MODEL_WEIGHT, weight))
+        return weight, 1.0 - weight
+    
+    @staticmethod
+    def _estimate_market_volatility_component(market_prob: Optional[float]) -> float:
+        """使用市场概率远离 0/100 的程度估算波动性 (0-1)."""
+        if market_prob is None:
+            return 0.5
+        try:
+            prob = max(0.0, min(100.0, float(market_prob)))
+        except (TypeError, ValueError):
+            return 0.5
+        variability = prob * (100.0 - prob)  # 抛物线, 在 50% 时最大
+        return min(1.0, variability / 2500.0)
+    
+    @staticmethod
+    def _estimate_price_impact_component(ai_prob: float, market_prob: float) -> float:
+        """根据 AI 与市场差值及流动性粗估价格冲击。"""
+        gap = abs(ai_prob - market_prob) / 100.0
+        liquidity_proxy = 1.0 - min(1.0, abs(50.0 - market_prob) / 50.0)
+        liquidity_proxy = max(0.2, liquidity_proxy)
+        impact = min(1.0, gap / liquidity_proxy)
+        return impact
 
     @staticmethod
     def evaluate_trade_signal(
@@ -1211,26 +1287,48 @@ class FusionEngine:
             days = 1.0
         days = max(1.0, days)
         ev = ai_val - market_val
-        annualized_ev = 0.0
+        edge_fraction = ev / 100.0
         try:
-            annualized_ev = ev / max((days / 365.0), 0.001)
+            annualized_ev = edge_fraction / max((days / 365.0), 0.01)
         except Exception:
             annualized_ev = 0.0
         uncertainty = FusionEngine._safe_float(event_uncertainty)
-        # [FIX] Use sanitized day value so risk factor remains stable for string inputs.
-        risk_factor = uncertainty + (days * volatility_coefficient)
+        volatility_component = FusionEngine._estimate_market_volatility_component(market_val)
+        price_impact_component = FusionEngine._estimate_price_impact_component(ai_val, market_val)
+        uncertainty_component = min(1.0, uncertainty / 25.0 if uncertainty is not None else 0.0)
+        risk_factor = (
+            0.45 * uncertainty_component +
+            0.35 * volatility_component +
+            0.20 * price_impact_component
+        )
 
         signal = "HOLD"
         signal_reason = "Await better edge"
-        if annualized_ev > 0.05 and risk_factor < 0.6:
+        slippage_cost = 0.02  # 2% slippage buffer
+        fee_cost = 0.01       # 1% fee buffer
+        base_edge_threshold = 0.03  # Require at least 3% raw edge before costs
+        dynamic_threshold = (
+            base_edge_threshold +
+            slippage_cost +
+            fee_cost +
+            (risk_factor * 0.04) +
+            (volatility_coefficient * 2)
+        )
+        if edge_fraction > dynamic_threshold and risk_factor < 0.85:
             signal = "BUY"
-            signal_reason = f"Positive EV ({annualized_ev:.2f}%) with low risk ({risk_factor:.2f})"
-        elif annualized_ev < -0.05 or risk_factor > 0.8:
+            signal_reason = (
+                f"Edge {edge_fraction*100:.2f}% exceeds threshold {dynamic_threshold*100:.2f}%, "
+                f"risk {risk_factor:.2f}"
+            )
+        elif edge_fraction < -dynamic_threshold:
             signal = "SELL"
-            if annualized_ev < -0.05:
-                signal_reason = f"Negative EV ({annualized_ev:.2f}%), market overpriced"
-            else:
-                signal_reason = f"High risk factor ({risk_factor:.2f}), avoid position"
+            signal_reason = (
+                f"Negative edge {edge_fraction*100:.2f}% (threshold {dynamic_threshold*100:.2f}%), "
+                f"favorable to sell"
+            )
+        elif risk_factor > 0.95:
+            signal = "SELL"
+            signal_reason = f"Risk factor extremely high ({risk_factor:.2f}), prefer capital preservation"
         print(
             f"[TRADE] Signal={signal}, EV={(ev or 0.0):.3f}, "
             f"Annualized={(annualized_ev or 0.0):.3f}, Risk={(risk_factor or 0.0):.2f}"
@@ -1240,7 +1338,9 @@ class FusionEngine:
             "ev": round(ev or 0.0, 4),
             "annualized_ev": round(annualized_ev or 0.0, 4),
             "risk_factor": round(risk_factor or 0.0, 3),
-            "signal_reason": signal_reason
+            "signal_reason": signal_reason,
+            "edge_threshold": round(dynamic_threshold, 4),
+            "slippage_fee": round(slippage_cost + fee_cost, 3)
         }
     
     def _apply_calibration(self, prob: float, method: str) -> Optional[float]:

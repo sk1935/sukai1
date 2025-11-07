@@ -19,7 +19,30 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 from datetime import datetime, timezone
+from pydantic import BaseModel, Field, ValidationError, ConfigDict
 
+from src.utils.safe_math import to_float, safe_mul, safe_add
+
+
+class FusionResult(BaseModel):
+    """Structured fusion output returned to higher layers."""
+
+    model_config = ConfigDict(extra="allow")
+
+    final_prob: float = Field(default=0.0)
+    model_only_prob: Optional[float] = None
+    uncertainty: float = Field(default=0.0, ge=0.0)
+    summary: str = Field(default="")
+    finalized_summary_text: str = Field(default="")
+    disagreement: str = Field(default="未知")
+    model_count: int = Field(default=0, ge=0)
+    deepseek_reasoning: Optional[str] = None
+    model_versions: Dict[str, Any] = Field(default_factory=dict)
+    weight_source: Dict[str, Any] = Field(default_factory=dict)
+    model_confidence_factor: float = Field(default=0.0)
+    fusion_weights: Dict[str, float] = Field(default_factory=lambda: {"model_weight": 1.0, "market_weight": 0.0})
+    total_weight: float = Field(default=0.0)
+    risk_factor: Optional[float] = None
 
 class FusionEngine:
     """
@@ -185,6 +208,9 @@ class FusionEngine:
         print(f"[DEBUG] ========== fuse_predictions START ==========")
         print(f"[DEBUG] Model results count: {len(model_results)}")
         print(f"[DEBUG] Market prob: {market_prob}")
+        market_prob_raw = market_prob
+        market_prob = to_float(market_prob, 0.0)  # 防止 NoneType 导致 TypeError
+        market_prob_missing = market_prob_raw is None
         # Filter out None results
         valid_results = {
             name: result
@@ -212,24 +238,33 @@ class FusionEngine:
         
         for model_name, result in valid_results.items():
             prob = self._safe_float(result.get("probability"))
-            confidence = result["confidence"]
+            confidence = result.get("confidence")
+            if confidence not in self.CONFIDENCE_WEIGHTS:
+                print("[fuse_predictions] missing confidence, defaulting to 'medium'")
+                confidence = "medium"
             reasoning = self._combine_reasonings(result)
             
             # Use LMArena base weight instead of model_weights parameter
             base_weight = self._get_base_weight(model_name)
             confidence_weight = self.CONFIDENCE_WEIGHTS.get(confidence, 2.0)
             confidence_factor = self._compute_model_confidence_factor(model_name, base_weight, confidence_weight, result)
-            total_weight = (
-                self._safe_float(base_weight, 0.0)
-                * self._safe_float(confidence_weight, 0.0)
-                * (0.5 + confidence_factor / 2)
+            base_component = to_float(base_weight, 0.0)
+            confidence_component = to_float(confidence_weight, 1.0) or 1.0  # 防止 NoneType 导致 TypeError
+            confidence_factor_value = to_float(confidence_factor, 0.0)
+            blend_component = 0.5 + confidence_factor_value / 2.0
+            if confidence_factor is None:
+                print("[fuse_predictions] blend_component is None, defaulting to 1.0")
+                blend_component = 1.0
+            total_weight = safe_mul(
+                safe_mul(base_component, confidence_component),
+                blend_component
             )
             
             probabilities.append(prob)
-            weights.append(total_weight)
+            weights.append(to_float(total_weight, 0.0))
             # Only add reasoning, not model name
             reasonings.append(reasoning)
-            confidence_factors.append(confidence_factor)
+            confidence_factors.append(confidence_factor_value)
             
             # Extract DeepSeek reasoning separately
             if model_name == "deepseek-chat":
@@ -248,16 +283,22 @@ class FusionEngine:
         
         # Combine with market probability (if market_bias enabled)
         if self._should_use_market_bias():
-            avg_conf_factor = self._mean(confidence_factors) if confidence_factors else 0.5
-            dynamic_model_weight, dynamic_market_weight = self._compute_dynamic_fusion_weights(
-                avg_conf_factor,
-                uncertainty,
-                market_prob
-            )
-            final_prob = (
-                dynamic_model_weight * consensus_weight +
-                dynamic_market_weight * market_prob
-            )
+            if market_prob_missing:
+                print("[fuse_predictions] market_prob is None, falling back to AI-only weights")
+                dynamic_model_weight = 1.0
+                dynamic_market_weight = 0.0
+                final_prob = consensus_weight
+            else:
+                avg_conf_factor = self._mean(confidence_factors) if confidence_factors else 0.5
+                dynamic_model_weight, dynamic_market_weight = self._compute_dynamic_fusion_weights(
+                    avg_conf_factor,
+                    uncertainty,
+                    market_prob
+                )
+                final_prob = safe_add(
+                    safe_mul(dynamic_model_weight, consensus_weight),
+                    safe_mul(dynamic_market_weight, market_prob)
+                )
         else:
             dynamic_model_weight = 1.0
             dynamic_market_weight = 0.0
@@ -287,6 +328,11 @@ class FusionEngine:
         
         # Generate summary
         summary = self._generate_summary(reasonings, consensus_weight, market_prob)
+        # Bugfix: ensure finalized_summary_text always exists to avoid NameError downstream
+        finalized_summary_text = summary or ""
+        if not finalized_summary_text.strip():
+            finalized_summary_text = "暂无详细推理信息。"
+        assert isinstance(finalized_summary_text, str), "finalized_summary_text must be a string"
         
         # Add weight source information
         weight_source = {
@@ -300,6 +346,7 @@ class FusionEngine:
             "model_only_prob": round(consensus_weight, 2),  # Pure model prediction before market fusion
             "uncertainty": round(uncertainty, 2),
             "summary": summary,
+            "finalized_summary_text": finalized_summary_text,
             "disagreement": disagreement,
             "model_count": len(valid_results),
             "deepseek_reasoning": deepseek_reasoning,  # DeepSeek's reasoning for separate display
@@ -309,7 +356,8 @@ class FusionEngine:
             "fusion_weights": {
                 "model_weight": round(dynamic_model_weight, 3),
                 "market_weight": round(dynamic_market_weight, 3)
-            }
+            },
+            "total_weight": float(sum(weights)) if weights else 0.0
         }
         
         # Add experiment flags if applicable
@@ -329,7 +377,12 @@ class FusionEngine:
         print(f"[DEBUG] Total model fusion time: {(total_time or 0.0):.2f}s")
         print(f"[DEBUG] ========== fuse_predictions END ==========")
         
-        return result
+        try:
+            fusion_model = FusionResult(**result)
+            return fusion_model.model_dump()
+        except ValidationError as exc:
+            print(f"[FusionEngine] FusionResult validation failed: {exc}")
+            return result
     
     def _get_model_versions(self, model_results: Dict[str, Optional[Dict]], orchestrator=None) -> Dict[str, Dict]:
         """Get model version information from ModelOrchestrator."""
@@ -893,11 +946,11 @@ class FusionEngine:
         else:
             # 按比例缩放
             scale_factor = 100.0 / total_before
-            normalized_probs = [prob * scale_factor for prob in ai_probs]
+            normalized_probs = [safe_mul(prob, scale_factor) for prob in ai_probs]
             
             # 归一化不确定度：保持相对比例，但需要相应缩放
             # 由于概率被缩放，不确定度也应该按相同比例缩放（保持相对关系）
-            normalized_uncertainties = [unc * scale_factor for unc in uncertainties]
+            normalized_uncertainties = [safe_mul(unc, scale_factor) for unc in uncertainties]
             
             # 验证总和
             total_after = sum(normalized_probs)
@@ -940,10 +993,10 @@ class FusionEngine:
                         print(f"⚠️ [WARNING] 归一化值异常：{outcome.get('name', i)} = {normalized_value}%")
                     
                     # 更新 prediction（融合后的概率）：需要重新融合
-                    market_prob = outcome.get("market_prob", 0)
-                    updated_prediction = (
-                        FusionEngine.MODEL_WEIGHT * normalized_probs[valid_idx] +
-                        FusionEngine.MARKET_WEIGHT * market_prob
+                    market_prob = to_float(outcome.get("market_prob", 0.0), 0.0)  # 防止 NoneType 导致 TypeError
+                    updated_prediction = safe_add(
+                        safe_mul(FusionEngine.MODEL_WEIGHT, normalized_probs[valid_idx]),
+                        safe_mul(FusionEngine.MARKET_WEIGHT, market_prob)
                     )
                     updated_outcome["prediction"] = round(updated_prediction, 2)
                     
@@ -1160,14 +1213,17 @@ class FusionEngine:
         return result
 
     @staticmethod
-    def _safe_float(value: Optional[float], default: float = 0.0) -> float:
+    def _safe_float(value: Optional[float], default: float = 0.0, label: Optional[str] = None) -> float:
         """Convert value to float safely with default fallback."""
-        try:
-            if value is None:
-                return default
-            return float(value)
-        except (TypeError, ValueError):
+        if value is None and label:
+            print(f"[SAFE] {label} is None, using default {default}")
             return default
+        safe_value = to_float(value, default)
+        if safe_value == default and value not in (default, None):
+            # 防止 NoneType 导致 TypeError
+            if label:
+                print(f"[SAFE] {label} invalid ({value}), using default {default}")
+        return safe_value
 
     @staticmethod
     def _mean(values: List[float]) -> float:
@@ -1190,10 +1246,16 @@ class FusionEngine:
         """Compute weighted mean with graceful fallback."""
         if not values:
             return 0.0
-        total_weight = math.fsum(weights) if weights else 0.0
+        total_weight = math.fsum(to_float(weight, 0.0) for weight in (weights or []))
         if total_weight <= 0:
             return cls._mean(values)
-        weighted_sum = math.fsum(val * weight for val, weight in zip(values, weights))
+        weighted_sum = math.fsum(
+            safe_mul(
+                to_float(val, 0.0),
+                to_float(weight, 0.0)
+            )
+            for val, weight in zip(values, weights)
+        )
         return weighted_sum / total_weight
 
     @classmethod
@@ -1201,12 +1263,15 @@ class FusionEngine:
         """Compute weighted standard deviation with safe defaults."""
         if not values:
             return 0.0
-        total_weight = math.fsum(weights) if weights else 0.0
+        total_weight = math.fsum(to_float(weight, 0.0) for weight in (weights or []))
         if total_weight <= 0:
             # Fall back to unweighted std
             return cls._std(values)
         variance = math.fsum(
-            weight * ((val - mean_value) ** 2)
+            safe_mul(
+                FusionEngine._safe_float(weight, 0.0, label="weighted_std_weight"),
+                (FusionEngine._safe_float(val, 0.0, label="weighted_std_value") - mean_value) ** 2
+            )
             for val, weight in zip(values, weights)
         ) / total_weight
         variance = max(variance, 0.0)
@@ -1221,10 +1286,19 @@ class FusionEngine:
     ) -> float:
         """Combine historical性能 and实时置信度得到模型贡献系数 (0-1)."""
         max_conf = max(self.CONFIDENCE_WEIGHTS.values())
-        historical_factor = min(1.0, self._safe_float(base_weight, 0.0) / 3.0)
-        realtime_factor = min(1.0, confidence_weight / max_conf if max_conf else 0.0)
+        historical_factor = min(1.0, self._safe_float(base_weight, 0.0, label=f"{model_name}_base_weight") / 3.0)
+        realtime_factor = min(
+            1.0,
+            self._safe_float(confidence_weight, 0.0, label=f"{model_name}_confidence_weight") / max_conf if max_conf else 0.0
+        )
         stability_bonus = 0.05 if result.get("calibration") else 0.0
-        factor = (0.5 * realtime_factor) + (0.4 * historical_factor) + stability_bonus
+        factor = safe_add(
+            safe_add(
+                safe_mul(0.5, realtime_factor),
+                safe_mul(0.4, historical_factor)
+            ),
+            stability_bonus
+        )
         return round(max(0.0, min(1.0, factor)), 4)
     
     def _compute_dynamic_fusion_weights(
@@ -1234,35 +1308,33 @@ class FusionEngine:
         market_prob: float
     ) -> Tuple[float, float]:
         """根据模型置信度和市场波动动态调整 AI/Market 权重。"""
+        market_prob = to_float(market_prob, 0.0)  # 防止 NoneType 导致 TypeError
         volatility_component = self._estimate_market_volatility_component(market_prob)
         uncertainty_component = min(1.0, self._safe_float(consensus_uncertainty) / 25.0)
         # 模型权重基础值在 0.55 - 0.9 之间
-        weight = (
-            self.MIN_MODEL_WEIGHT
-            + 0.35 * avg_conf_factor
-            - 0.2 * volatility_component
-            - 0.1 * uncertainty_component
-        )
+        avg_conf = self._safe_float(avg_conf_factor, 0.0, label="avg_conf_factor")
+        weight = self.MIN_MODEL_WEIGHT
+        weight = safe_add(weight, safe_mul(0.35, avg_conf))
+        weight = safe_add(weight, -safe_mul(0.2, volatility_component))
+        weight = safe_add(weight, -safe_mul(0.1, uncertainty_component))
         weight = max(self.MIN_MODEL_WEIGHT, min(self.MAX_MODEL_WEIGHT, weight))
         return weight, 1.0 - weight
     
     @staticmethod
     def _estimate_market_volatility_component(market_prob: Optional[float]) -> float:
         """使用市场概率远离 0/100 的程度估算波动性 (0-1)."""
-        if market_prob is None:
-            return 0.5
-        try:
-            prob = max(0.0, min(100.0, float(market_prob)))
-        except (TypeError, ValueError):
-            return 0.5
-        variability = prob * (100.0 - prob)  # 抛物线, 在 50% 时最大
+        prob = FusionEngine._safe_float(market_prob, default=50.0, label="market_prob_volatility")
+        prob = max(0.0, min(100.0, prob))
+        variability = safe_mul(prob, (100.0 - prob))  # 抛物线, 在 50% 时最大
         return min(1.0, variability / 2500.0)
     
     @staticmethod
     def _estimate_price_impact_component(ai_prob: float, market_prob: float) -> float:
         """根据 AI 与市场差值及流动性粗估价格冲击。"""
-        gap = abs(ai_prob - market_prob) / 100.0
-        liquidity_proxy = 1.0 - min(1.0, abs(50.0 - market_prob) / 50.0)
+        safe_ai = FusionEngine._safe_float(ai_prob, 0.0, label="ai_prob_price_impact")
+        safe_market = FusionEngine._safe_float(market_prob, 0.0, label="market_prob_price_impact")
+        gap = abs(safe_ai - safe_market) / 100.0
+        liquidity_proxy = 1.0 - min(1.0, abs(50.0 - safe_market) / 50.0)
         liquidity_proxy = max(0.2, liquidity_proxy)
         impact = min(1.0, gap / liquidity_proxy)
         return impact
@@ -1276,43 +1348,47 @@ class FusionEngine:
         volatility_coefficient: float = 0.01
     ) -> Dict[str, Union[str, float]]:
         """Evaluate a simple trade signal using EV and risk heuristics."""
-        ai_val = FusionEngine._safe_float(ai_prob)
-        market_val = FusionEngine._safe_float(market_prob)
-        days_raw = days_to_resolution if days_to_resolution and days_to_resolution > 0 else 1
-        # [FIX] Normalize resolution days with float guard for EV/risk calculations.
-        try:
-            days = float(days_raw or 1.0)
-        except (TypeError, ValueError):
-            print("[FIX] Invalid days_to_resolution for trade signal; defaulting to 1.0")
+        ai_val = FusionEngine._safe_float(ai_prob, label="trade_ai_prob")
+        market_val = FusionEngine._safe_float(market_prob, label="trade_market_prob")
+        days = FusionEngine._safe_float(days_to_resolution, default=1.0, label="days_to_resolution")
+        if days <= 0:
+            print("[SAFE] days_to_resolution <= 0, defaulting to 1.0")
             days = 1.0
-        days = max(1.0, days)
         ev = ai_val - market_val
         edge_fraction = ev / 100.0
         try:
             annualized_ev = edge_fraction / max((days / 365.0), 0.01)
         except Exception:
             annualized_ev = 0.0
-        uncertainty = FusionEngine._safe_float(event_uncertainty)
+        uncertainty = FusionEngine._safe_float(event_uncertainty, label="event_uncertainty")
         volatility_component = FusionEngine._estimate_market_volatility_component(market_val)
         price_impact_component = FusionEngine._estimate_price_impact_component(ai_val, market_val)
-        uncertainty_component = min(1.0, uncertainty / 25.0 if uncertainty is not None else 0.0)
-        risk_factor = (
-            0.45 * uncertainty_component +
-            0.35 * volatility_component +
-            0.20 * price_impact_component
+        uncertainty_component = min(1.0, uncertainty / 25.0 if uncertainty else 0.0)
+        # 调整权重，放大高波动场景的风险占比，确保更符合交易直觉
+        risk_factor = safe_add(
+            safe_add(
+                safe_mul(0.40, uncertainty_component),
+                safe_mul(0.40, volatility_component)
+            ),
+            safe_mul(0.20, price_impact_component)
         )
 
         signal = "HOLD"
         signal_reason = "Await better edge"
+        volatility_coefficient = FusionEngine._safe_float(
+            volatility_coefficient,
+            default=0.01,
+            label="volatility_coefficient"
+        ) or 0.01
         slippage_cost = 0.02  # 2% slippage buffer
         fee_cost = 0.01       # 1% fee buffer
         base_edge_threshold = 0.03  # Require at least 3% raw edge before costs
-        dynamic_threshold = (
-            base_edge_threshold +
-            slippage_cost +
-            fee_cost +
-            (risk_factor * 0.04) +
-            (volatility_coefficient * 2)
+        dynamic_threshold = safe_add(
+            safe_add(
+                safe_add(base_edge_threshold, safe_add(slippage_cost, fee_cost)),
+                safe_mul(risk_factor, 0.04)
+            ),
+            safe_mul(volatility_coefficient, 2)
         )
         if edge_fraction > dynamic_threshold and risk_factor < 0.85:
             signal = "BUY"
@@ -1396,3 +1472,24 @@ class FusionEngine:
             # Fit calibration model here
             # For now, calibration_map remains None
             pass
+
+
+def evaluate_trade_signal(
+    ai_prob: Optional[float],
+    market_prob: Optional[float],
+    days_to_resolution: Optional[int] = None,
+    event_uncertainty: Optional[float] = None,
+    volatility_coefficient: float = 0.01
+) -> Dict[str, Union[str, float]]:
+    """
+    Module-level wrapper to match external call expectations.
+    
+    # 防止 NoneType 导致 TypeError
+    """
+    return FusionEngine.evaluate_trade_signal(
+        ai_prob=ai_prob,
+        market_prob=market_prob,
+        days_to_resolution=days_to_resolution,
+        event_uncertainty=event_uncertainty,
+        volatility_coefficient=volatility_coefficient
+    )

@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from output_formatter import OutputFormatter  # noqa: E402
 
@@ -82,3 +83,59 @@ def test_trade_signal_warning_for_missing_data():
 def test_reasoning_sanitization_strips_markdown(input_text, expected):
     cleaned = OutputFormatter._sanitize_reasoning_text(input_text)
     assert expected in cleaned
+
+
+def test_multi_option_deepseek_without_summary_stays_safe():
+    formatter = OutputFormatter()
+    event_data = {"question": "Test multi option"}
+    outcomes = [
+        {
+            "name": "Option A",
+            "model_only_prob": 60.0,
+            "prediction": 60.0,
+            "market_prob": 45.0,
+            "summary": "",
+            "uncertainty": 4.0
+        },
+        {
+            "name": "Option B",
+            "model_only_prob": 40.0,
+            "prediction": 40.0,
+            "market_prob": 55.0,
+            "summary": "",
+            "uncertainty": 4.0
+        }
+    ]
+    fusion_result = {"deepseek_reasoning": "DeepSeek standalone reasoning text."}
+
+    output = formatter.format_multi_option_prediction(
+        event_data,
+        outcomes,
+        normalization_info={"event_type": "mutually_exclusive"},
+        fusion_result=fusion_result
+    )
+    assert "模型洞察" in output
+
+
+def test_conditional_deepseek_without_summary_stays_safe():
+    formatter = OutputFormatter()
+    event_data = {"question": "Date condition event"}
+    outcomes = [
+        {
+            "name": "Before Dec",
+            "model_only_prob": 0.0,
+            "prediction": 0.0,
+            "market_prob": 30.0,
+            "summary": "",
+            "uncertainty": 0.0
+        }
+    ]
+    fusion_result = {"deepseek_reasoning": "DeepSeek reasoning for conditional."}
+
+    output = formatter.format_conditional_prediction(
+        event_data,
+        outcomes,
+        normalization_info={"event_type": "conditional"},
+        fusion_result=fusion_result
+    )
+    assert "模型洞察" in output

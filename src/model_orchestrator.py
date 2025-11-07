@@ -22,10 +22,39 @@ import re
 import time
 import traceback
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
+from pydantic import BaseModel, Field, field_validator, ValidationError, ConfigDict
 from dotenv import load_dotenv
 
+from src.utils.safe_math import to_float, safe_mul, safe_add
+
 load_dotenv()
+
+
+class ModelOutput(BaseModel):
+    """Structured model output shared with downstream components."""
+
+    model_config = ConfigDict(extra="allow", str_strip_whitespace=True)
+
+    probability: float = Field(default=50.0, ge=0.0, le=100.0)
+    confidence: str = Field(default="medium")
+    reasoning: str = Field(default="")
+    reasoning_short: Optional[str] = None
+    reasoning_long: Optional[str] = None
+    raw_output: Optional[str] = None
+    calibration: Optional[Dict[str, Any]] = None
+    raw_probability: Optional[float] = Field(default=None, ge=0.0, le=100.0)
+
+    @field_validator("confidence", mode="before")
+    def _normalize_confidence(cls, value):
+        if not isinstance(value, str):
+            print("[orchestrator] missing confidence, defaulting factor=1.0")
+            return "medium"
+        lowered = value.lower()
+        if lowered not in {"low", "medium", "high"}:
+            print("[orchestrator] invalid confidence, defaulting factor=1.0")
+            return "medium"
+        return lowered
 
 # 各模型自适应超时时间（秒）- 基于实际API响应速度
 MODEL_TIMEOUTS = {
@@ -159,12 +188,13 @@ class ModelOrchestrator:
             
             enabled_models.append(model_config.get("display_name", model_id))
             
+            weight_value = to_float(model_config.get("weight", 1.0), 1.0)
             models_dict[model_id] = {
                 "display_name": model_config.get("display_name", model_id),
                 "source": source,
                 "url": url,
                 "api_key_env": model_config["api_key_env"],
-                "weight": model_config["weight"],
+                "weight": weight_value,
                 "fallback": model_config.get("fallback"),
                 "fallback_display_name": model_config.get("fallback_display_name"),
                 "last_updated": model_config.get("last_updated", "未知"),
@@ -174,12 +204,13 @@ class ModelOrchestrator:
             # Add fallback model if exists (only if primary model is enabled)
             if model_config.get("fallback"):
                 fallback_id = model_config["fallback"]
+                fallback_weight = safe_mul(weight_value, 0.9)
                 models_dict[fallback_id] = {
                     "display_name": model_config.get("fallback_display_name", fallback_id),
                     "source": source,
                     "url": url,
                     "api_key_env": model_config["api_key_env"],
-                    "weight": model_config["weight"] * 0.9,  # Slightly lower weight for fallback
+                    "weight": fallback_weight,
                     "fallback": None,
                     "last_updated": model_config.get("last_updated", "未知"),
                     "is_default": False
@@ -301,9 +332,12 @@ class ModelOrchestrator:
     def _platt_scale_probability(self, model_name: str, probability: float) -> float:
         """Apply Platt scaling to model probability to improve calibration."""
         params = self._get_platt_params(model_name)
-        normalized = max(0.001, min(0.999, probability / 100.0))
+        prob_value = to_float(probability, 50.0)
+        normalized = max(0.001, min(0.999, prob_value / 100.0))
         logit = math.log(normalized / (1 - normalized))
-        logistic_input = params["A"] * logit + params["B"]
+        param_a = to_float(params.get("A", 0.0), 0.0)
+        param_b = to_float(params.get("B", 0.0), 0.0)
+        logistic_input = safe_add(safe_mul(param_a, logit), param_b)
         try:
             scaled = 1 / (1 + math.exp(-logistic_input))
         except OverflowError:
@@ -314,17 +348,25 @@ class ModelOrchestrator:
         if not result or "probability" not in result:
             return result
         calibrated = dict(result)
-        raw_prob = calibrated.get("probability", 50.0)
+        raw_prob = to_float(calibrated.get("probability", 50.0), 50.0)
         calibrated_prob = self._platt_scale_probability(model_name, raw_prob)
         calibrated["raw_probability"] = raw_prob
         calibrated["probability"] = calibrated_prob
         params = self._get_platt_params(model_name)
         calibrated["calibration"] = {
             "method": "platt",
-            "A": params.get("A", 0.0),
-            "B": params.get("B", 0.0)
+            "A": to_float(params.get("A", 0.0), 0.0),
+            "B": to_float(params.get("B", 0.0), 0.0)
         }
-        return calibrated
+        return self._build_model_output(calibrated)
+    
+    def _build_model_output(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Validate and normalize model outputs with Pydantic."""
+        try:
+            return ModelOutput(**data).model_dump()
+        except ValidationError as exc:
+            print(f"[ModelOrchestrator] ModelOutput validation failed: {exc}")
+            return ModelOutput().model_dump()
     
     async def call_model(self, model_name: str, prompt: str, max_retries: int = None) -> Optional[Dict]:
         """
@@ -562,11 +604,16 @@ class ModelOrchestrator:
             data = json.loads(content)
             
             # Validate and normalize
-            prob = float(data.get("probability", 50.0))
+            prob = to_float(data.get("probability", 50.0), 50.0)
             prob = max(0.0, min(100.0, prob))  # Clamp to [0, 100]
             
-            confidence = data.get("confidence", "medium").lower()
+            confidence_raw = data.get("confidence")
+            if confidence_raw:
+                confidence = confidence_raw.lower()
+            else:
+                confidence = None
             if confidence not in ["low", "medium", "high"]:
+                print("[orchestrator] missing confidence, defaulting factor=1.0")
                 confidence = "medium"
             
             reasoning_candidates = [
@@ -593,7 +640,7 @@ class ModelOrchestrator:
             prob_match = re.search(r'probability["\s:]+(\d+\.?\d*)', original_content, re.IGNORECASE)
             if prob_match:
                 try:
-                    prob = float(prob_match.group(1))
+                    prob = to_float(prob_match.group(1), 50.0)
                     prob = max(0.0, min(100.0, prob))
                     print(f"✅ Extracted probability from text: {prob}%")
                     recovered = self._extract_sentences(original_content)

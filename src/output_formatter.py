@@ -12,9 +12,13 @@
 输出：格式化的中文 Markdown 字符串（Telegram 消息）
 """
 import json
+import logging
 import re
 from difflib import SequenceMatcher
 from typing import Dict, List, Optional
+
+
+logger = logging.getLogger(__name__)
 
 
 class OutputFormatter:
@@ -30,6 +34,23 @@ class OutputFormatter:
     
     def __init__(self):
         pass
+
+    def format_low_probability_notice(
+        self,
+        event_data: Dict,
+        threshold: float,
+        max_probability: float
+    ) -> str:
+        """Provide a markdown formatted notice when event is filtered out."""
+        question = self.safe_markdown_text(event_data.get("question", "该事件"))
+        threshold_val = max(0.0, threshold)
+        max_val = max(0.0, max_probability)
+        return (
+            f"⚠️ *低概率提醒*\n\n"
+            f"事件「{question}」的最高市场概率仅为 {max_val:.2f}%，"
+            f"低于设定阈值 {threshold_val:.2f}% 。\n"
+            f"为保证报告质量，已暂时跳过该事件的深度预测。"
+        )
 
     @staticmethod
     def _extract_trade_signal_data(trade_data: Optional[Dict]) -> Dict:
@@ -551,7 +572,7 @@ class OutputFormatter:
         
         # AI逻辑摘要（使用第一个有效摘要）
         first_summary = None
-        finalized_summary_text = ""
+        finalized_summary_text = ""  # Ensure variable always initialized to avoid NameError
         for outcome in sorted_outcomes:
             summary = outcome.get('summary', '')
             if summary and len(summary) > 30 and '暂无' not in summary:
@@ -564,6 +585,8 @@ class OutputFormatter:
                 finalized_summary_text = finalized_summary
                 summary_escaped = self.safe_markdown_text(finalized_summary)
                 output += f"🧠 *AI逻辑摘要*\n\n{summary_escaped}\n\n"
+        else:
+            finalized_summary_text = ""  # 强制默认值，避免后续 DeepSeek 比较时报错
         
         # 市场偏离信号
         output += "🚨 *市场偏离信号*\n\n"
@@ -616,13 +639,18 @@ class OutputFormatter:
                     deepseek_reasoning = outcome['deepseek_reasoning']
                     break
         
+        finalized_summary_text = finalized_summary_text or ""  # 防御性赋值，确保存在
+
         if deepseek_reasoning:
             finalized_deepseek = self._finalize_reasoning_text(deepseek_reasoning, limit=500)
             if finalized_deepseek and finalized_summary_text:
-                similarity = self._reasoning_similarity(finalized_summary_text, finalized_deepseek)
-                if similarity >= 0.9:
-                    print("[FORMAT] Skipped redundant model insight")
-                    finalized_deepseek = ""
+                try:
+                    similarity = self._reasoning_similarity(finalized_summary_text, finalized_deepseek)
+                    if similarity >= 0.9:
+                        print("[FORMAT] Skipped redundant model insight")
+                        finalized_deepseek = ""
+                except Exception as exc:
+                    logger.exception("DeepSeek 摘要去重时发生异常: %s", exc)
             if finalized_deepseek:
                 deepseek_text = self.safe_markdown_text(finalized_deepseek)
                 deepseek_section = f"\n🧠 *模型洞察 \\(DeepSeek\\)*\n━━━━━━━━━━━━━━━━━━━━\n{deepseek_text}\n━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -1294,7 +1322,37 @@ class OutputFormatter:
             short_rules = rules[:150] + "..." if len(rules) > 150 else rules
             rules_escaped = self.safe_markdown_text(short_rules)
             output += f"\n📜 *规则:* {rules_escaped}\n"
-        
+
+        # DeepSeek insight block (multi-option)
+        finalized_summary_text = finalized_summary_text or ""  # 保证始终有可用于比较的基准摘要
+        deepseek_section = ""
+        deepseek_reasoning = None
+        if fusion_result and fusion_result.get('deepseek_reasoning'):
+            deepseek_reasoning = fusion_result.get('deepseek_reasoning')
+        elif outcomes:
+            for outcome in outcomes:
+                if outcome.get('deepseek_reasoning'):
+                    deepseek_reasoning = outcome['deepseek_reasoning']
+                    break
+        if deepseek_reasoning:
+            finalized_deepseek = self._finalize_reasoning_text(deepseek_reasoning, limit=500)
+            if finalized_deepseek and finalized_summary_text:
+                try:
+                    similarity = self._reasoning_similarity(finalized_summary_text, finalized_deepseek)
+                    if similarity >= 0.9:
+                        print("[FORMAT] Skipped redundant model insight (multi-option)")
+                        finalized_deepseek = ""
+                except Exception as exc:
+                    logger.exception("Multi-option DeepSeek 摘要去重时发生异常: %s", exc)
+            if finalized_deepseek:
+                deepseek_text = self.safe_markdown_text(finalized_deepseek)
+                deepseek_section = (
+                    "\n🧠 *模型洞察 \\(DeepSeek\\)*\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    f"{deepseek_text}\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n\n"
+                )
+
         # Model versions section (for multi-option events)
         # Collect model versions and weight source from all outcomes (they should all have the same versions)
         model_versions = None

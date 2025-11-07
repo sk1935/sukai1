@@ -13,6 +13,7 @@
 """
 import asyncio
 import inspect
+import logging
 import os
 from dotenv import load_dotenv
 import signal
@@ -195,6 +196,24 @@ except ImportError:
 load_dotenv()
 
 
+def _configure_logging() -> logging.Logger:
+    """Configure application-wide logging once and return module logger."""
+    level_name = os.getenv("POLYMARKET_LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+
+    if not logging.getLogger().handlers:
+        logging.basicConfig(
+            level=level,
+            format="%(asctime)s %(levelname)s [%(name)s] %(message)s"
+        )
+    root_logger = logging.getLogger()
+    root_logger.setLevel(level)
+    return logging.getLogger("polymarket")
+
+
+BOT_LOGGER = _configure_logging()
+
+
 async def maybe_await(result):
     """Await result if it is awaitable, otherwise return it directly."""
     if inspect.isawaitable(result):
@@ -222,26 +241,40 @@ class ForecastingBot:
     - 所有输出均为中文
     """
     
-    def __init__(self):
-        self.event_manager = EventManager()
-        self.prompt_builder = PromptBuilder()
-        self.model_orchestrator = ModelOrchestrator()
-        self.fusion_engine = FusionEngine()
-        self.output_formatter = OutputFormatter()
-        self.event_analyzer = EventAnalyzer()
-        
+    def __init__(
+        self,
+        event_manager: Optional[EventManager] = None,
+        prompt_builder: Optional[PromptBuilder] = None,
+        model_orchestrator: Optional[ModelOrchestrator] = None,
+        fusion_engine: Optional[FusionEngine] = None,
+        output_formatter: Optional[OutputFormatter] = None,
+        event_analyzer: Optional[EventAnalyzer] = None,
+        notion_logger: Optional[NotionLogger] = None,
+        logger: Optional[logging.Logger] = None,
+    ):
+        self.logger = logger or BOT_LOGGER.getChild("bot")
+        self.event_manager = event_manager or EventManager()
+        self.prompt_builder = prompt_builder or PromptBuilder()
+        self.model_orchestrator = model_orchestrator or ModelOrchestrator()
+        self.fusion_engine = fusion_engine or FusionEngine()
+        self.output_formatter = output_formatter or OutputFormatter()
+        self.event_analyzer = event_analyzer or EventAnalyzer()
+
         # 初始化 Notion Logger（如果配置了环境变量）
-        try:
-            self.notion_logger = NotionLogger()
-            if self.notion_logger and self.notion_logger.enabled:
-                print("✅ Notion Logger 已启用，预测结果将自动保存到 Notion")
-            elif self.notion_logger:
-                print("⚠️ Notion Logger 已创建但未启用（请检查配置）")
-        except Exception as e:
-            print(f"⚠️ Notion Logger 初始化异常: {type(e).__name__}: {e}")
-            import traceback
-            traceback.print_exc()
-            self.notion_logger = None
+        if notion_logger is not None:
+            self.notion_logger = notion_logger
+        else:
+            try:
+                self.notion_logger = NotionLogger()
+                if self.notion_logger and self.notion_logger.enabled:
+                    self.logger.info("Notion Logger 已启用，预测结果将自动保存到 Notion")
+                elif self.notion_logger:
+                    self.logger.warning("Notion Logger 已创建但未启用（请检查配置）")
+            except Exception as e:
+                self.logger.exception("Notion Logger 初始化异常: %s", e)
+                import traceback
+                traceback.print_exc()
+                self.notion_logger = None
     
     async def _prepare_prediction_context(
         self,
@@ -378,8 +411,7 @@ class ForecastingBot:
                 "rules_summary": event_data.get("rules", "")[:100] if event_data.get("rules") else "无规则信息"
             }
 
-        print("
-📊 事件全面分析:")
+        print("\n📊 事件全面分析:")
         print(f"  类别: {full_analysis['event_category']} ({full_analysis.get('event_category_display', '未知')})")
         print(f"  市场趋势: {full_analysis['market_trend']}")
         sentiment_score = full_analysis.get('sentiment_score') or 0.0
@@ -423,8 +455,7 @@ class ForecastingBot:
             available_models=None,
             orchestrator=self.model_orchestrator
         )
-        print(f"
-📊 Event Category: {event_analysis['category']}")
+        print(f"\n📊 Event Category: {event_analysis['category']}")
         print(f"📐 Dimensions: {len(event_analysis['dimensions'])}")
         model_names = [
             model for model in event_analysis["model_assignments"].keys()
@@ -1048,6 +1079,8 @@ class ForecastingBot:
         if message_text is None:
             return
 
+        self.logger.info("收到 /predict 请求: %s", message_text.strip()[:120])
+
         try:
             # Parse event
             event_info = self.event_manager.parse_event_from_message(message_text)
@@ -1061,6 +1094,26 @@ class ForecastingBot:
                 return
             
             event_data = await self._fetch_event_data(update, event_info)
+
+            low_probability_info = self.event_manager.filter_low_probability_event(event_data)
+            if low_probability_info:
+                notice_text = self.output_formatter.format_low_probability_notice(
+                    event_data,
+                    threshold=low_probability_info["threshold"],
+                    max_probability=low_probability_info["max_probability"]
+                )
+                self.logger.warning(
+                    "事件被过滤，原因：低概率 (question=%s, max_prob=%.2f, threshold=%.2f)",
+                    event_data.get("question", "未知事件"),
+                    low_probability_info["max_probability"],
+                    low_probability_info["threshold"]
+                )
+                await maybe_await(update.message.reply_text(
+                    notice_text,
+                    parse_mode="Markdown"
+                ))
+                return
+
             (
                 event_analysis,
                 full_analysis,
@@ -1277,11 +1330,8 @@ class ForecastingBot:
         except Exception as e:
             error_type = type(e).__name__
             error_msg = str(e)
-            print(f"❌ [ERROR] Error in handle_predict: {error_type}: {error_msg}")
-            import traceback
-            print(f"[DEBUG] Full traceback:")
-            traceback.print_exc()
-            
+            self.logger.exception("handle_predict 处理异常: %s", error_msg)
+
             await maybe_await(update.message.reply_text(
                 self.output_formatter.format_error(
                     f"处理请求时出错: {error_type}: {error_msg}"
@@ -1374,6 +1424,25 @@ def list_models():
         print(f"默认模型: {', '.join(default_models)}")
     
     print("\n" + "=" * 80)
+
+
+REQUIRED_ENV_VARS = (
+    "TELEGRAM_BOT_TOKEN",
+    "AICANAPI_KEY",
+    "DEEPSEEK_API_KEY",
+    "OPENROUTER_API_KEY",
+    "NOTION_TOKEN",
+    "NOTION_DB_ID"
+    # POLYMARKET_API_KEY is optional - system works without it
+)
+
+
+def _validate_required_environment() -> None:
+    """Ensure all critical environment variables exist before bootstrapping."""
+    missing = [key for key in REQUIRED_ENV_VARS if not os.environ.get(key)]
+    if missing:
+        missing_list = ", ".join(missing)
+        sys.exit(f"Error: Missing required environment variable(s): {missing_list}")
 
 
 def main():
@@ -1611,20 +1680,3 @@ if __name__ == "__main__":
         test_notion_write()
     else:
         main()
-REQUIRED_ENV_VARS = (
-    "TELEGRAM_BOT_TOKEN",
-    "AICANAPI_KEY",
-    "DEEPSEEK_API_KEY",
-    "OPENROUTER_API_KEY",
-    "NOTION_TOKEN",
-    "NOTION_DB_ID",
-    "POLYMARKET_API_KEY"
-)
-
-
-def _validate_required_environment() -> None:
-    """Ensure all critical environment variables exist before bootstrapping."""
-    missing = [key for key in REQUIRED_ENV_VARS if not os.environ.get(key)]
-    if missing:
-        missing_list = ", ".join(missing)
-        sys.exit(f"Error: Missing required environment variable(s): {missing_list}")

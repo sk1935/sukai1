@@ -47,14 +47,6 @@
     "source": "NewsAPI",
     "timestamp": "2025-11-03T21:00:19.534823"
   },
-  "https polymarket com": {
-    "keyword": "https polymarket com",
-    "sentiment": "neutral",
-    "score": 0.0,
-    "sample_count": 20,
-    "source": "GDELT",
-    "timestamp": "2025-11-04T07:24:58.519730"
-  },
   "maduro out": {
     "keyword": "maduro out",
     "sentiment": "neutral",
@@ -151,20 +143,28 @@
     "source": "GDELT",
     "timestamp": "2025-11-05T22:32:33.387289"
   },
+  "russia ukraine ceasefire": {
+    "keyword": "russia ukraine ceasefire",
+    "sentiment": "neutral",
+    "score": 0.0,
+    "sample_count": 20,
+    "source": "GDELT",
+    "timestamp": "2025-11-07T19:48:58.418808"
+  },
+  "https polymarket com": {
+    "keyword": "https polymarket com",
+    "sentiment": "neutral",
+    "score": 0.0,
+    "sample_count": 20,
+    "source": "GDELT",
+    "timestamp": "2025-11-07T21:36:46.441381"
+  },
   "2nd largest company": {
     "keyword": "2nd largest company",
     "sentiment": "neutral",
     "score": 0.0,
     "sample_count": 20,
     "source": "GDELT",
-    "timestamp": "2025-11-06T07:09:22.898463"
-  },
-  "russia ukraine ceasefire": {
-    "keyword": "russia ukraine ceasefire",
-    "sentiment": "neutral",
-    "score": 0.05,
-    "sample_count": 89,
-    "source": "NewsAPI",
-    "timestamp": "2025-11-06T19:29:24.875281"
+    "timestamp": "2025-11-07T22:05:18.988424"
   }
 }

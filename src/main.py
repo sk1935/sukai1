@@ -70,9 +70,60 @@ except Exception as e:
     import traceback
     traceback.print_exc()
 
+# --- Compatibility patch for python-telegram-bot + Python 3.13 ---
+# Apply patch BEFORE importing telegram.ext to fix Python 3.13 compatibility
+_patch_applied = False
+try:
+    import sys
+    from pathlib import Path
+    
+    # Ensure src directory is in path for imports
+    src_path = Path(__file__).parent
+    if str(src_path) not in sys.path:
+        sys.path.insert(0, str(src_path))
+    
+    # Try multiple import strategies
+    patch_updater_slots = None
+    patch_telegram_weakrefs = None
+    try:
+        # Strategy 1: Direct import (when src is in path)
+        from compat.telegram_patch import patch_updater_slots, patch_telegram_weakrefs
+    except ImportError:
+        try:
+            # Strategy 2: Relative import (when running as module)
+            from .compat.telegram_patch import patch_updater_slots, patch_telegram_weakrefs
+        except (ImportError, ValueError):
+            try:
+                # Strategy 3: Absolute import
+                from src.compat.telegram_patch import patch_updater_slots, patch_telegram_weakrefs
+            except ImportError as patch_import_err:
+                print(f"[Init] ⚠️ Telegram patch import failed: {patch_import_err}")
+    
+    # Apply Updater patch BEFORE importing telegram.ext
+    if patch_updater_slots is not None:
+        try:
+            patch_updater_slots()
+            _patch_applied = True
+        except Exception as patch_err:
+            print(f"[Init] ⚠️ Telegram Updater patch not applied: {patch_err}")
+    else:
+        print(f"[Init] ⚠️ Telegram patch function not found")
+except Exception as final_err:
+    print(f"[Init] ⚠️ Telegram patch setup failed: {final_err}")
+    import traceback
+    traceback.print_exc()
+# -----------------------------------------------------------------
+
 try:
     from telegram import Update
     from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+    
+    # Apply JobQueue weakref patch AFTER importing telegram.ext
+    if patch_telegram_weakrefs is not None:
+        try:
+            patch_telegram_weakrefs()
+        except Exception as weakref_patch_err:
+            print(f"[Init] ⚠️ Telegram JobQueue weakref patch not applied: {weakref_patch_err}")
 except ImportError:
     try:
         from telegram import Update
@@ -862,11 +913,14 @@ class ForecastingBot:
         else:
             reason = "无有效模型结果"
 
-        market_prob = outcome.get("market_prob") or 0.0
+        market_prob = outcome.get("market_prob")
         if market_prob is None:
-            print(f"⚠️ market_prob is None for {outcome_name}, using default 0.0")
+            print(f"⚠️ market_prob is None for {outcome_name}, no market fallback available")
             market_prob = 0.0
-        print(f"  ⚠️ 无AI预测: {outcome_name}（{reason}，有效结果数: {valid_count}），使用市场价格 {(market_prob or 0.0):.1f}%")
+        print(
+            f"  ⚠️ 无AI预测: {outcome_name}（{reason}，有效结果数: {valid_count}），"
+            f"使用市场价格 {market_prob:.1f}%"
+        )
 
         fused_outcome = {
             "name": outcome_name,
@@ -1095,7 +1149,7 @@ class ForecastingBot:
             
             event_data = await self._fetch_event_data(update, event_info)
 
-            low_probability_info = self.event_manager.filter_low_probability_event(event_data)
+            low_probability_info = await self.event_manager.filter_low_probability_event(event_data)
             if low_probability_info:
                 notice_text = self.output_formatter.format_low_probability_notice(
                     event_data,

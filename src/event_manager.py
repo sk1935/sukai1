@@ -18,7 +18,7 @@ import html
 import logging
 import traceback
 from datetime import datetime
-from typing import Dict, Optional, List, Any
+from typing import Dict, Optional, List, Any, Tuple
 from urllib.parse import quote_plus
 import os
 from pydantic import BaseModel, Field, field_validator, ValidationError, ConfigDict, ValidationInfo
@@ -39,7 +39,7 @@ class Event(BaseModel):
     slug: Optional[str] = None
     question: str = Field(default="Unknown event", min_length=1)
     title: Optional[str] = None
-    market_prob: float = Field(default=0.0, ge=0.0, le=100.0)
+    market_prob: Optional[float] = Field(default=None)
     rules: Optional[str] = None
     description: Optional[str] = None
     outcomes: List[Dict[str, Any]] = Field(default_factory=list)
@@ -61,10 +61,12 @@ class Event(BaseModel):
 
     @field_validator("market_prob", mode="before")
     def _clamp_prob(cls, value):
+        if value is None or value == "":
+            return None
         try:
             numeric = float(value)
         except (TypeError, ValueError):
-            return 0.0
+            return None
         return max(0.0, min(100.0, numeric))
 
 
@@ -86,7 +88,7 @@ class EventManager:
     def __init__(self):
         self.api_key = os.getenv("POLYMARKET_API_KEY", "")
 
-    def filter_low_probability_event(
+    async def filter_low_probability_event(
         self,
         event_data: Optional[Dict[str, Any]],
         threshold: float = None
@@ -103,38 +105,142 @@ class EventManager:
             threshold_value = 1.0
 
         try:
-            outcomes = event_data.get("outcomes") if isinstance(event_data, dict) else None
             probability_candidates: List[float] = []
 
-            if isinstance(outcomes, list) and outcomes:
-                for outcome in outcomes:
-                    if not isinstance(outcome, dict):
-                        continue
-                    for key in ("model_only_prob", "prediction", "probability", "market_prob"):
-                        value = outcome.get(key)
-                        if value is None:
+            def _append_probability(value: Any, source: str) -> Optional[float]:
+                """Validate probability value from any source and append when valid."""
+                if value is None:
+                    return None
+                try:
+                    prob_value = float(value)
+                except (TypeError, ValueError):
+                    logger.debug(f"[LowProbFilter] {source} 不是有效数字: %s", value)
+                    return None
+                if prob_value <= 0.0:
+                    logger.debug(f"[LowProbFilter] 忽略 {source} 的 0 或负值: %.2f", prob_value)
+                    return None
+                if prob_value > 100.0:
+                    logger.debug(f"[LowProbFilter] 忽略 {source} 超界值: %.2f", prob_value)
+                    return None
+                probability_candidates.append(prob_value)
+                logger.debug(f"[LowProbFilter] 使用 {source} = {prob_value:.2f}%")
+                return prob_value
+
+            # 优先使用 event_data 中的 market_prob
+            _append_probability(event_data.get("market_prob"), "event_data.market_prob")
+
+            # 备用：从 outcomes 中提取
+            if not probability_candidates:
+                outcomes = event_data.get("outcomes")
+                if isinstance(outcomes, list) and outcomes:
+                    logger.debug(f"[LowProbFilter] market_prob 不可用，检查 {len(outcomes)} 个 outcomes")
+                    for idx, outcome in enumerate(outcomes):
+                        if not isinstance(outcome, dict):
                             continue
-                        try:
-                            probability_candidates.append(float(value))
-                            break
-                        except (TypeError, ValueError):
-                            continue
-            else:
-                for key in ("market_prob", "probability"):
-                    value = event_data.get(key) if isinstance(event_data, dict) else None
-                    if value is None:
-                        continue
+                        for key in ("model_only_prob", "prediction", "probability", "market_prob"):
+                            value = outcome.get(key)
+                            if value is None:
+                                continue
+                            _append_probability(value, f"outcomes[{idx}].{key}")
+
+            # 备用：尝试 CLOB 实时数据
+            if not probability_candidates:
+                metadata = event_data.get("metadata") or {}
+                market_id = (
+                    event_data.get("market_id")
+                    or event_data.get("id")
+                    or metadata.get("market_id")
+                    or metadata.get("id")
+                )
+                slug = (
+                    event_data.get("slug")
+                    or metadata.get("slug")
+                )
+                market_id_str = str(market_id) if market_id else None
+
+                if not market_id_str and not slug:
+                    logger.warning(
+                        "[LowProbFilter] ❌ 无法触发 CLOB fallback，缺少 market_id/slug (keys=%s)",
+                        list(event_data.keys())
+                    )
+                else:
+                    logger.info(
+                        "[LowProbFilter] 所有来源失败，尝试 CLOB fallback (market_id=%s, slug=%s)",
+                        market_id_str,
+                        slug
+                    )
                     try:
-                        probability_candidates.append(float(value))
-                        break
-                    except (TypeError, ValueError):
-                        continue
+                        clob_prob = await self._fetch_clob_probability(
+                            market_id_str,
+                            slug=slug
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "[LowProbFilter] ❌ CLOB API 调用异常 (market_id=%s, slug=%s): %s",
+                            market_id_str,
+                            slug,
+                            exc
+                        )
+                    else:
+                        if clob_prob is None:
+                            logger.warning(
+                                "[LowProbFilter] ❌ CLOB API 未返回概率数据 (market_id=%s, slug=%s)",
+                                market_id_str,
+                                slug
+                            )
+                        else:
+                            appended_value = _append_probability(clob_prob, "clob_api")
+                            if appended_value is not None:
+                                logger.info(
+                                    "[LowProbFilter] ✅ CLOB API 返回有效概率: %.2f%% (market_id=%s, slug=%s)",
+                                    appended_value,
+                                    market_id_str,
+                                    slug
+                                )
+                            else:
+                                try:
+                                    numeric_clob = float(clob_prob)
+                                except (TypeError, ValueError):
+                                    logger.warning(
+                                        "[LowProbFilter] ⚠️ CLOB API 返回非数字概率: %s (market_id=%s, slug=%s)",
+                                        clob_prob,
+                                        market_id_str,
+                                        slug
+                                    )
+                                else:
+                                    if numeric_clob <= 0.0:
+                                        logger.warning(
+                                            "[LowProbFilter] ⚠️ CLOB API 返回无效概率 (<=0): %.2f%% (market_id=%s, slug=%s)",
+                                            numeric_clob,
+                                            market_id_str,
+                                            slug
+                                        )
+                                    elif numeric_clob > 100.0:
+                                        logger.warning(
+                                            "[LowProbFilter] ⚠️ CLOB API 返回无效概率 (>100): %.2f%% (market_id=%s, slug=%s)",
+                                            numeric_clob,
+                                            market_id_str,
+                                            slug
+                                        )
+                                    else:
+                                        logger.warning(
+                                            "[LowProbFilter] ⚠️ CLOB API 返回概率未被采纳: %.2f%% (market_id=%s, slug=%s)",
+                                            numeric_clob,
+                                            market_id_str,
+                                            slug
+                                        )
 
             if not probability_candidates:
+                logger.debug("[LowProbFilter] 未找到任何概率数据，不执行过滤")
                 return None
 
             max_prob = max(probability_candidates)
             min_prob = min(probability_candidates)
+
+            logger.debug(
+                f"[LowProbFilter] 概率范围: {min_prob:.2f}% - {max_prob:.2f}%, 阈值: {threshold_value:.2f}%"
+            )
+
             if max_prob < threshold_value:
                 logger.warning(
                     "过滤事件：所有概率低于阈值 (max=%.2f, threshold=%.2f)",
@@ -468,10 +574,14 @@ class EventManager:
         event_query = event_info.get('query', '')
         slug = event_info.get('slug')
         
+        best_effort_payload: Optional[Dict[str, Any]] = None
+
         # Try concurrent primary sources first (slugs + search + graphql)
-        primary_payload = await self._fetch_primary_sources_concurrently(event_query, slug)
+        primary_payload, partial_payload = await self._fetch_primary_sources_concurrently(event_query, slug)
         if primary_payload:
             return primary_payload
+        if partial_payload:
+            best_effort_payload = partial_payload
         
         # If we have a slug (especially from URL), prioritize API over scraping
         # URL provides exact slug, so API lookup is most reliable and accurate
@@ -597,6 +707,39 @@ class EventManager:
                                     
                                 if matched_event:
                                     event_id = event.get('id')
+                                    detail_slug = event.get('slug') or slug
+
+                                    if not event_id and detail_slug:
+                                        fallback_detail = await self._fetch_event_detail(
+                                            None,
+                                            detail_slug,
+                                            session=session
+                                        )
+                                        if fallback_detail:
+                                            payload = await self._parse_markets_array(
+                                                fallback_detail.get("markets"),
+                                                detail_slug,
+                                                fallback_detail.get('title') or fallback_detail.get('question') or event.get('question', '')
+                                            )
+                                            if payload:
+                                                return payload
+                                            logger.warning(
+                                                "[Events] Event detail (slug=%s) 缺少 markets 或无法解析",
+                                                detail_slug
+                                            )
+                                        else:
+                                            logger.warning(
+                                                "[Events] 无法通过 slug=%s 获取 event detail",
+                                                detail_slug
+                                            )
+                                        slug_result = await self._parse_market_via_slug_fallback(
+                                            detail_slug,
+                                            session,
+                                            "events_missing_event_id"
+                                        )
+                                        if slug_result:
+                                            return slug_result
+                                        logger.debug("[Fallback] 继续使用 /events 返回的基础数据 (slug=%s)", detail_slug)
                                     
                                     # Get full event details to access markets
                                     if event_id:
@@ -613,8 +756,11 @@ class EventManager:
                                                     
                                                     # Event may contain markets with outcomes
                                                     # For multi-option events, extract options from individual markets
-                                                    if 'markets' in event_detail:
-                                                        markets = event_detail['markets']
+                                                    markets = event_detail.get('markets')
+                                                    if markets:
+                                                        if isinstance(markets, list):
+                                                            for mkt in markets:
+                                                                self._attach_slug_hint(mkt, detail_slug)
                                                         
                                                         # Check if this is a grouped market (has groupItemTitle in any market)
                                                         is_grouped_market = False
@@ -753,7 +899,7 @@ class EventManager:
                                                                             total_volume = sum(float(m.get('volume', 0)) for m in child_markets)
                                                                             return self._validate_event_payload({
                                         "question": event_title,
-                                        "market_prob": outcome_list[0]["market_prob"] if outcome_list else 0.0,
+                                        "market_prob": outcome_list[0]["market_prob"] if outcome_list else None,
                                         "rules": event_detail.get('description', ''),
                                         "volume": int(total_volume),
                                         "days_left": 30,
@@ -844,7 +990,11 @@ class EventManager:
                                                                 
                                                                 # Parse the market - allow fetch_children to work
                                                                 # Don't pass fetch_children=False to allow parent event detection
-                                                                result = self._parse_rest_market_data(market)
+                                                                self._attach_slug_hint(market, slug)
+                                                                result = await self._parse_rest_market_data(
+                                                                    market,
+                                                                    slug_hint=slug
+                                                                )
                                                                 
                                                                 # If this is a parent event, try to fetch its children
                                                                 if result.get('_is_parent_event'):
@@ -891,7 +1041,7 @@ class EventManager:
                                                                             total_volume = sum(float(m.get('volume', 0)) for m in child_markets)
                                                                             return self._validate_event_payload({
                                         "question": parent_title,
-                                        "market_prob": outcome_list[0]["market_prob"] if outcome_list else 0.0,
+                                        "market_prob": outcome_list[0]["market_prob"] if outcome_list else None,
                                         "rules": result.get('rules', ''),
                                         "volume": int(total_volume),
                                         "days_left": 30,
@@ -908,7 +1058,19 @@ class EventManager:
                                             # Fallback: use event data directly without details
                                             if not event.get('question') and event_title:
                                                 event['question'] = event_title
-                                            result = self._parse_rest_market_data(event, fetch_children=False)
+                                            slug_result = await self._parse_market_via_slug_fallback(
+                                                slug,
+                                                session,
+                                                "events_detail_timeout"
+                                            )
+                                            if slug_result:
+                                                return slug_result
+                                            self._attach_slug_hint(event, slug)
+                                            result = await self._parse_rest_market_data(
+                                                event,
+                                                fetch_children=False,
+                                                slug_hint=slug
+                                            )
                                             
                                             # Check if parent event
                                             if result.get('_is_parent_event'):
@@ -959,7 +1121,7 @@ class EventManager:
                                                         total_volume = sum(float(m.get('volume', 0)) for m in child_markets)
                                                         return self._validate_event_payload({
                         "question": parent_title,
-                        "market_prob": outcome_list[0]["market_prob"] if outcome_list else 0.0,
+                        "market_prob": outcome_list[0]["market_prob"] if outcome_list else None,
                         "rules": result.get('rules', ''),
                         "volume": int(total_volume),
                         "days_left": 30,
@@ -975,7 +1137,19 @@ class EventManager:
                                     # Ensure question is set
                                     if not event.get('question') and event_title:
                                         event['question'] = event_title
-                                    result = self._parse_rest_market_data(event, fetch_children=False)
+                                    slug_result = await self._parse_market_via_slug_fallback(
+                                        slug,
+                                        session,
+                                        "events_detail_missing"
+                                    )
+                                    if slug_result:
+                                        return slug_result
+                                    self._attach_slug_hint(event, slug)
+                                    result = await self._parse_rest_market_data(
+                                        event,
+                                        fetch_children=False,
+                                        slug_hint=slug
+                                    )
                                     
                                     # Check if parent event in final fallback
                                     if result.get('_is_parent_event'):
@@ -1015,7 +1189,7 @@ class EventManager:
                                                 total_volume = sum(float(m.get('volume', 0)) for m in child_markets)
                                                 return self._validate_event_payload({
                             "question": parent_title,
-                            "market_prob": outcome_list[0]["market_prob"] if outcome_list else 0.0,
+                            "market_prob": outcome_list[0]["market_prob"] if outcome_list else None,
                             "rules": result.get('rules', ''),
                             "volume": int(total_volume),
                             "days_left": 30,
@@ -1028,7 +1202,6 @@ class EventManager:
                                     
                                     return result
                                 # If matched_event is None after all checks, break out to try next method
-                                else:
                                     print(f"⚠️ No matching event found in /events endpoint, trying next method...")
                 except (asyncio.TimeoutError, aiohttp.ClientError, aiohttp.ClientConnectorError) as e:
                     error_type = type(e).__name__
@@ -1069,16 +1242,28 @@ class EventManager:
                                                     if detail_response.status == 200:
                                                         market_detail = await detail_response.json()
                                                         print(f"✅ Got full market details via Gamma API")
-                                                        return self._parse_rest_market_data(market_detail)
+                                                        self._attach_slug_hint(market_detail, slug)
+                                                        return await self._parse_rest_market_data(
+                                                            market_detail,
+                                                            slug_hint=slug
+                                                        )
                                             except (asyncio.TimeoutError, Exception) as e:
                                                 print(f"⚠️ Could not get market details, using basic market data: {e}")
                                                 # Return basic market data instead of failing
-                                        return self._parse_rest_market_data(market)
+                                        self._attach_slug_hint(market, slug)
+                                        return await self._parse_rest_market_data(
+                                            market,
+                                            slug_hint=slug
+                                        )
                             elif isinstance(markets, dict):
                                 # Single market object
                                 if markets.get('slug', '').lower() == slug.lower():
                                     print(f"✅ Found market via Gamma API /markets (direct): {markets.get('question', 'Unknown')}")
-                                    return self._parse_rest_market_data(markets)
+                                    self._attach_slug_hint(markets, slug)
+                                    return await self._parse_rest_market_data(
+                                        markets,
+                                        slug_hint=slug
+                                    )
                         else:
                             print(f"⚠️ Gamma API /markets returned {response.status}")
                 except (asyncio.TimeoutError, aiohttp.ClientError, aiohttp.ClientConnectorError) as e:
@@ -1106,7 +1291,11 @@ class EventManager:
                                 # Verify it's the right market by checking slug
                                 if market.get('slug', '').lower() == slug.lower():
                                     print(f"✅ Found market via REST API (slug): {market.get('question', 'Unknown')}")
-                                    return self._parse_rest_market_data(market)
+                                    self._attach_slug_hint(market, slug)
+                                    return await self._parse_rest_market_data(
+                                        market,
+                                        slug_hint=slug
+                                    )
                         else:
                             print(f"⚠️ REST API slug parameter returned {response.status}")
                 except asyncio.TimeoutError:
@@ -1139,7 +1328,11 @@ class EventManager:
                                         market_slug = market.get('slug', '').lower()
                                         if market_slug == slug.lower():
                                             print(f"✅ Found exact slug match via REST API (query: '{query_text}'): {market.get('question', 'Unknown')}")
-                                            return self._parse_rest_market_data(market)
+                                            self._attach_slug_hint(market, slug)
+                                            return await self._parse_rest_market_data(
+                                                market,
+                                                slug_hint=slug
+                                            )
                                     
                                     # Log if we got close but don't continue searching
                                     if markets:
@@ -1354,11 +1547,23 @@ class EventManager:
                                                                 }, "fetch_polymarket_data.event_title_final")
                                                             elif len(markets) > 0:
                                                                 market = markets[0]
-                                                                return self._parse_rest_market_data(market)
+                                                                self._attach_slug_hint(market, slug)
+                                                                return await self._parse_rest_market_data(
+                                                                    market,
+                                                                    slug_hint=slug
+                                                                )
                                         except asyncio.TimeoutError:
                                             print(f"⏱️ Event detail fetch timeout (text search), using basic event data")
-                                            return self._parse_rest_market_data(best_match)
-                                    return self._parse_rest_market_data(best_match)
+                                            self._attach_slug_hint(best_match, slug)
+                                            return await self._parse_rest_market_data(
+                                                best_match,
+                                                slug_hint=slug
+                                            )
+                                    self._attach_slug_hint(best_match, slug)
+                                    return await self._parse_rest_market_data(
+                                        best_match,
+                                        slug_hint=slug
+                                    )
                 except asyncio.TimeoutError:
                     print(f"⏱️ /events text search timeout, trying other methods...")
                 except Exception as e:
@@ -1495,7 +1700,7 @@ class EventManager:
                                 if best_score >= min_score and best_market:
                                     market = best_market
                                     print(f"✅ Found relevant market (score: {best_score}/{min_score}): {market.get('question', 'Unknown')}")
-                                    return self._parse_rest_market_data(market)
+                                    return await self._parse_rest_market_data(market)
                                 else:
                                     # No good match found - log for debugging
                                     print(f"⚠️ No relevant market found (best score: {best_score}/{min_score})")
@@ -1589,10 +1794,14 @@ class EventManager:
                 if scraped_data:
                     return scraped_data
             
-            # Still return mock data but add a note
-            mock_data = self._create_mock_market_data(event_query)
-            mock_data["is_mock"] = True
-            return mock_data
+        if best_effort_payload:
+            print("⚠️ Returning best-effort payload without confirmed market probability")
+            return best_effort_payload
+
+        # Still return mock data but add a note
+        mock_data = self._create_mock_market_data(event_query)
+        mock_data["is_mock"] = True
+        return mock_data
     
     def _extract_option_name(self, question: str) -> Optional[str]:
         """
@@ -1768,7 +1977,13 @@ class EventManager:
         
         return []
     
-    def _parse_rest_market_data(self, market: Dict, fetch_children: bool = True) -> Dict:
+    async def _parse_rest_market_data(
+        self,
+        market: Dict,
+        fetch_children: bool = True,
+        allow_refetch: bool = True,
+        slug_hint: Optional[str] = None
+    ) -> Dict:
         """
         Parse market data from REST API response.
         
@@ -1777,6 +1992,8 @@ class EventManager:
             fetch_children: If True and this is a parent event, try to fetch child markets
         """
         # REST API returns different structure
+        slug_hint = slug_hint or market.get("slug") or market.get("_slug_hint")
+
         question = market.get("question", "") or market.get("title", "")
         # If still empty, try to get from event or reconstruct from slug
         if not question:
@@ -1789,7 +2006,7 @@ class EventManager:
         question = self._clean_html_fragment(question)
         # Check if this is a parent event with placeholder
         if fetch_children and self._is_parent_event_title(question):
-            print(f"🔍 检测到父事件标题（包含占位符）: {question}")
+            logger.debug("🔍 检测到父事件标题（包含占位符）: %s", question)
             # This is a parent event, should not be treated as a single market
             # Return a special marker to indicate we need to fetch children
             parent_payload = {
@@ -1820,33 +2037,33 @@ class EventManager:
         if isinstance(outcomes, str):
             try:
                 outcomes = json.loads(outcomes)
-                print(f"✅ 解析 outcomes 字符串: {outcomes}")
+                logger.debug("✅ 解析 outcomes 字符串: %s", outcomes)
             except json.JSONDecodeError as e:
-                print(f"⚠️ 无法解析 outcomes 字符串: {e}")
+                logger.warning("⚠️ 无法解析 outcomes 字符串: %s", e)
                 outcomes = []
         
         # Parse outcome prices if it's a string
         if isinstance(outcome_prices, str):
             try:
                 outcome_prices = json.loads(outcome_prices)
-                print(f"✅ 解析 outcomePrices 字符串: {outcome_prices}")
+                logger.debug("✅ 解析 outcomePrices 字符串: %s", outcome_prices)
             except json.JSONDecodeError as e:
-                print(f"⚠️ 无法解析 outcomePrices 字符串: {e}")
+                logger.warning("⚠️ 无法解析 outcomePrices 字符串: %s", e)
                 outcome_prices = []
         
         # Ensure outcomes is a list
         if not isinstance(outcomes, list):
-            print(f"⚠️ outcomes 不是列表类型: {type(outcomes)}, 值: {outcomes}")
+            logger.warning("⚠️ outcomes 不是列表类型: %s, 值: %s", type(outcomes), outcomes)
             outcomes = []
         
         # Ensure outcome_prices is a list
         if not isinstance(outcome_prices, list):
-            print(f"⚠️ outcome_prices 不是列表类型: {type(outcome_prices)}, 值: {outcome_prices}")
+            logger.warning("⚠️ outcome_prices 不是列表类型: %s, 值: %s", type(outcome_prices), outcome_prices)
             outcome_prices = []
         
         # Check if multi-option (more than 2 outcomes)
         is_multi_option = len(outcomes) > 2
-        print(f"🔍 市场类型判断: {len(outcomes)} 个选项, 是否多选项: {is_multi_option}")
+        logger.debug("🔍 市场类型判断: %s 个选项, 是否多选项: %s", len(outcomes), is_multi_option)
         
         # Build outcome list with probabilities
         outcome_list = []
@@ -1857,17 +2074,17 @@ class EventManager:
             
             prices_count = len(outcome_prices)
             outcomes_count = len(outcomes)
-            print(f"🔍 解析多选项: {outcomes_count} 个 outcomes, {prices_count} 个价格")
+            logger.debug("🔍 解析多选项: %s 个 outcomes, %s 个价格", outcomes_count, prices_count)
             
             if prices_count != outcomes_count:
-                print(f"⚠️ 警告: outcomes 和 outcome_prices 数量不一致 ({outcomes_count} vs {prices_count})")
+                logger.warning("⚠️ 警告: outcomes 和 outcome_prices 数量不一致 (%s vs %s)", outcomes_count, prices_count)
             
-            print(f"   outcomes 内容: {outcomes[:5]}...")  # 打印前5个用于调试
+            logger.debug("   outcomes 内容: %s...", outcomes[:5])
             
             for i, outcome_name in enumerate(outcomes):
                 # Validate outcome_name is a string and not empty
                 if not isinstance(outcome_name, str) or not outcome_name.strip():
-                    print(f"⚠️ 跳过无效选项 {i}: {outcome_name} (类型: {type(outcome_name)})")
+                    logger.debug("⚠️ 跳过无效选项 %s: %s (类型: %s)", i, outcome_name, type(outcome_name))
                     continue
                 
                 # Try to get price for this outcome
@@ -1879,12 +2096,12 @@ class EventManager:
                         if prob <= 1:
                             prob = prob * 100
                     except (ValueError, TypeError, IndexError) as e:
-                        print(f"   ⚠️ 无法解析选项 {i} 的价格 ({outcome_name}): {e}")
+                        logger.warning("   ⚠️ 无法解析选项 %s 的价格 (%s): %s", i, outcome_name, e)
                         prob = None
                 
                 # If no valid price, use default 0% (will be filtered later if needed)
                 if prob is None:
-                    print(f"   ⚠️ 选项 {i} ({outcome_name}) 没有有效的价格数据，使用默认值 0%")
+                    logger.debug("   ⚠️ 选项 %s (%s) 没有有效的价格数据，使用默认值 0%%", i, outcome_name)
                     prob = 0.0
                 
                 # Only add if probability is positive (or if we want to include all options)
@@ -1895,65 +2112,147 @@ class EventManager:
                     "probability": round(prob, 2),
                     "market_prob": round(prob, 2)
                 })
-                print(f"   ✅ 选项 {i+1}: {clean_name} = {round(prob, 2)}%")
+                logger.debug("   ✅ 选项 %s: %s = %.2f%%", i + 1, clean_name, round(prob, 2))
         
-        print(f"📋 最终解析到 {len(outcome_list)} 个有效选项")
+        logger.debug("📋 最终解析到 %s 个有效选项", len(outcome_list))
         
-        # For binary markets, keep existing logic
-        market_prob = None  # Don't use default, try to extract real value
+        probability_source: Optional[str] = None
+        market_prob: Optional[float] = None  # Don't use default, try to extract real value
+
+        def _set_probability(value: Any, source: str) -> None:
+            nonlocal market_prob, probability_source
+            if market_prob is not None:
+                return
+            prob = self._convert_price_to_percentage(value)
+            if prob is None:
+                return
+            if prob <= 0.0:
+                logger.debug("⚠️ %s 返回 0 或负概率，忽略", source)
+                return
+            market_prob = prob
+            probability_source = source
+            logger.debug("✅ Extracted probability from %s: %.2f%%", source, market_prob)
+
         if not is_multi_option:
             # Method 1: outcomePrices (can be array or JSON string)
             if outcome_prices and len(outcome_prices) > 0:
-                try:
-                    prob_str = str(outcome_prices[0])
-                    prob = float(prob_str)
-                    if prob <= 1:
-                        market_prob = prob * 100
+                _set_probability(outcome_prices[0], "outcomePrices")
+
+            # Method 2: explicit yes/no price fields
+            _set_probability(market.get("yesPrice"), "yesPrice")
+
+            if market_prob is None and market.get("noPrice") is not None:
+                no_prob = self._convert_price_to_percentage(market.get("noPrice"))
+                if no_prob is not None:
+                    market_prob = max(0.0, min(100.0, 100.0 - no_prob))
+                    if market_prob > 0.0:
+                        probability_source = "noPrice"
+                        logger.debug("✅ Extracted probability from noPrice: %.2f%%", market_prob)
                     else:
-                        market_prob = prob
-                    print(f"✅ Extracted from outcomePrices: {market_prob}%")
-                except (ValueError, TypeError, IndexError, json.JSONDecodeError) as e:
-                    print(f"⚠️ Could not parse outcomePrices: {e}")
-        
-        # Method 2: bestBid and bestAsk (mid price)
-        if market_prob is None and market.get("bestBid") and market.get("bestAsk"):
-            try:
-                bid = float(market["bestBid"])
-                ask = float(market["bestAsk"])
-                mid_price = (bid + ask) / 2
-                market_prob = mid_price * 100
-                print(f"✅ Extracted from bestBid/bestAsk: {market_prob}%")
-            except (ValueError, TypeError):
-                pass
-        
-        # Method 3: lastTradePrice
-        if market_prob is None and market.get("lastTradePrice"):
-            try:
-                prob = float(market["lastTradePrice"])
-                if prob <= 1:
-                    market_prob = prob * 100
-                else:
-                    market_prob = prob
-                print(f"✅ Extracted from lastTradePrice: {market_prob}%")
-            except (ValueError, TypeError):
-                pass
-        
-        # Method 4: currentPrice (if available)
-        if market_prob is None and market.get("currentPrice"):
-            try:
-                prob = float(market["currentPrice"])
-                if prob <= 1:
-                    market_prob = prob * 100
-                else:
-                    market_prob = prob
-                print(f"✅ Extracted from currentPrice: {market_prob}%")
-            except (ValueError, TypeError):
-                pass
-        
-        # Don't use default values - if we can't extract price, return None
+                        logger.debug("⚠️ noPrice 推导出 0%%，继续尝试其他数据源")
+                        market_prob = None
+                        probability_source = None
+
+            _set_probability(market.get("price"), "price")
+            _set_probability(market.get("lastPrice"), "lastPrice")
+
+            # Method 3: bestBid and bestAsk (mid price)
+            if market_prob is None:
+                bid = market.get("bestBid")
+                ask = market.get("bestAsk")
+                if bid is not None and ask is not None:
+                    try:
+                        bid_raw = float(bid)
+                        ask_raw = float(ask)
+                        mid_price = (bid_raw + ask_raw) / 2
+                        mid_prob = self._convert_price_to_percentage(mid_price)
+                        if mid_prob is not None:
+                            market_prob = mid_prob
+                            probability_source = "bestBid/bestAsk"
+                            logger.debug("✅ Extracted probability from bestBid/bestAsk: %.2f%%", market_prob)
+                    except (ValueError, TypeError):
+                        pass
+                elif bid is not None:
+                    _set_probability(bid, "bestBid")
+                elif ask is not None:
+                    _set_probability(ask, "bestAsk")
+
+            # Method 4: trade/current price hints
+            if market_prob is None:
+                _set_probability(market.get("lastTradePrice"), "lastTradePrice")
+            if market_prob is None:
+                _set_probability(market.get("currentPrice"), "currentPrice")
+            if market_prob is None:
+                _set_probability(market.get("probability"), "probability")
+
+            # Method 5: fetch from CLOB API for live data
+            if market_prob is None:
+                market_id = market.get("id") or market.get("marketId")
+                if market_id or slug_hint:
+                    clob_prob = await self._fetch_clob_probability(
+                        market_id,
+                        slug=slug_hint
+                    )
+                    if clob_prob is not None and clob_prob > 0.0:
+                        market_prob = clob_prob
+                        probability_source = "clob"
+                        logger.info("✅ Extracted probability from CLOB API: %.2f%%", market_prob)
+                    else:
+                        logger.warning(
+                            "⚠️ CLOB API 未返回有效概率 (market_id=%s, slug=%s)",
+                            market_id,
+                            slug_hint
+                        )
+
         if market_prob is None:
-            print(f"⚠️ Could not extract market probability from any source")
-            # Return None instead of default value - let caller handle this
+            market_id = market.get("id") or market.get("marketId")
+            if allow_refetch:
+                logger.warning(
+                    "[Refetch] 所有概率提取方法失败，尝试重新获取市场数据 (market_id=%s, slug_hint=%s)",
+                    market_id,
+                    slug_hint
+                )
+                try:
+                    enriched_market = await self._fetch_market_snapshot(
+                        market_id=market_id,
+                        slug=slug_hint
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "[Refetch] ❌ 重新获取市场数据时发生异常: %s",
+                        exc
+                    )
+                    enriched_market = None
+
+                if enriched_market:
+                    logger.info(
+                        "♻️ Re-fetching market details via /markets (id=%s, slug=%s)",
+                        enriched_market.get("id"),
+                        enriched_market.get("slug")
+                    )
+                    return await self._parse_rest_market_data(
+                        enriched_market,
+                        fetch_children=fetch_children,
+                        allow_refetch=False,
+                        slug_hint=slug_hint
+                    )
+                else:
+                    logger.warning(
+                        "[Refetch] ❌ 无法重新获取市场数据 (market_id=%s, slug_hint=%s)",
+                        market_id,
+                        slug_hint
+                    )
+            else:
+                logger.info(
+                    "[Refetch] allow_refetch=False，跳过重新获取 (market_id=%s, slug_hint=%s)",
+                    market_id,
+                    slug_hint
+                )
+
+            logger.warning(
+                "⚠️ Could not extract market probability from any source (market_id=%s)",
+                market_id
+            )
         
         # Extract description/rules
         rules = market.get("description", "") or "查看原链接获取完整规则"
@@ -1969,18 +2268,266 @@ class EventManager:
             "days_left": days_left,
             "trend": "→",
             "is_mock": False,
-            "source": "rest_api"
+            "source": "rest_api",
+            "market_id": market.get("id") or market.get("marketId")
         }
+
+        if probability_source:
+            metadata = dict(result.get("metadata") or {})
+            metadata["probability_source"] = probability_source
+            if result.get("market_id"):
+                metadata.setdefault("market_id", result["market_id"])
+            result["metadata"] = metadata
         
         # Add multi-option data if available
         if is_multi_option:
             result["is_multi_option"] = True
             result["outcomes"] = outcome_list
-            print(f"✅ 检测到多选项市场: {len(outcome_list)} 个选项")
+            logger.debug("✅ 检测到多选项市场: %s 个选项", len(outcome_list))
         else:
             result["is_multi_option"] = False
         
         return self._validate_event_payload(result, "rest_api_market")
+    
+    async def _fetch_market_snapshot(
+        self,
+        market_id: Optional[str] = None,
+        slug: Optional[str] = None,
+        session: Optional[aiohttp.ClientSession] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Fetch a single market payload via Gamma/REST endpoints for enrichment."""
+        if not market_id and not slug:
+            return None
+        owns_session = session is None
+        if owns_session:
+            session = aiohttp.ClientSession()
+        try:
+            candidate_urls: List[str] = []
+            if market_id:
+                candidate_urls.append(f"https://gamma-api.polymarket.com/markets/{market_id}")
+                candidate_urls.append(f"{self.POLYMARKET_REST_URL}?ids={market_id}")
+            if slug:
+                candidate_urls.append(f"{self.POLYMARKET_REST_URL}?slug={slug}")
+                candidate_urls.append(f"https://gamma-api.polymarket.com/markets?slug={slug}")
+            for url in candidate_urls:
+                try:
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=6)) as response:
+                        if response.status != 200:
+                            logger.debug("[MarketSnapshot] %s status=%s", url, response.status)
+                            continue
+                        payload = await response.json()
+                except Exception as exc:
+                    logger.debug("[MarketSnapshot] 请求失败 (%s): %s", url, exc)
+                    continue
+                market = self._select_market_from_payload(payload, market_id=market_id, slug=slug)
+                if market:
+                    logger.debug(
+                        "[MarketSnapshot] Loaded market via %s (id=%s, slug=%s)",
+                        url,
+                        market.get("id"),
+                        market.get("slug")
+                    )
+                    return market
+            return None
+        finally:
+            if owns_session and session:
+                await session.close()
+
+    def _attach_slug_hint(self, market: Any, slug: Optional[str]) -> None:
+        """Embed slug hint into market dict when upstream payload omits it."""
+        if not slug or not isinstance(market, dict):
+            return
+        market.setdefault("_slug_hint", slug)
+
+    async def _parse_markets_array(
+        self,
+        markets: Optional[List[Dict[str, Any]]],
+        slug_hint: Optional[str],
+        fallback_question: Optional[str]
+    ) -> Optional[Dict[str, Any]]:
+        """Iterate over event_detail markets and return the first parsed payload."""
+        if not isinstance(markets, list):
+            return None
+        for market in markets:
+            if not isinstance(market, dict):
+                continue
+            if fallback_question and not market.get("question"):
+                market["question"] = fallback_question
+            self._attach_slug_hint(market, slug_hint)
+            parsed = await self._parse_rest_market_data(
+                market,
+                slug_hint=slug_hint
+            )
+            if parsed:
+                return parsed
+        return None
+
+    async def _parse_market_via_slug_fallback(
+        self,
+        slug: Optional[str],
+        session: aiohttp.ClientSession,
+        context: str
+    ) -> Optional[Dict[str, Any]]:
+        """Attempt to fetch and parse market data via slug when primary flow fails."""
+        if not slug:
+            logger.debug("[Fallback][%s] 缺少 slug，无法执行 /markets 回退", context)
+            return None
+        logger.debug("[Fallback][%s] 尝试使用 slug=%s 从 /markets 获取完整数据", context, slug)
+        market = await self._fetch_market_snapshot(slug=slug, session=session)
+        if market:
+            self._attach_slug_hint(market, slug)
+            parsed = await self._parse_rest_market_data(
+                market,
+                fetch_children=False,
+                slug_hint=slug
+            )
+            if parsed:
+                logger.debug("[Fallback][%s] ✅ 成功解析 slug=%s 对应市场", context, slug)
+                return parsed
+        logger.warning("[Fallback][%s] ❌ 无法通过 slug=%s 获取有效市场数据", context, slug)
+        return None
+
+    def _select_market_from_payload(
+        self,
+        payload: Any,
+        market_id: Optional[str] = None,
+        slug: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Select a single market dict from mixed API payloads."""
+        candidates: List[Dict[str, Any]] = []
+        if isinstance(payload, dict):
+            if "markets" in payload and isinstance(payload["markets"], list):
+                candidates = [m for m in payload["markets"] if isinstance(m, dict)]
+            elif any(key in payload for key in ("id", "slug", "question")):
+                candidates = [payload]
+        elif isinstance(payload, list):
+            candidates = [m for m in payload if isinstance(m, dict)]
+        else:
+            return None
+
+        if not candidates:
+            return None
+
+        target_id = str(market_id).lower() if market_id else None
+        target_slug = slug.lower() if isinstance(slug, str) else None
+
+        if target_id:
+            for market in candidates:
+                value = market.get("id")
+                if value is not None and str(value).lower() == target_id:
+                    return market
+
+        if target_slug:
+            for market in candidates:
+                value = market.get("slug")
+                if isinstance(value, str) and value.lower() == target_slug:
+                    return market
+
+        return candidates[0]
+
+    async def _fetch_clob_probability(
+        self,
+        market_id: Optional[str],
+        slug: Optional[str] = None
+    ) -> Optional[float]:
+        """Fetch real-time probability data from Polymarket CLOB API."""
+        resolved_market_id = market_id
+        if not resolved_market_id and slug:
+            logger.info("[CLOB] market_id 缺失，尝试使用 slug=%s 解析", slug)
+            enriched = await self._fetch_market_snapshot(slug=slug)
+            resolved_market_id = enriched.get("id") if enriched else None
+            if resolved_market_id:
+                logger.info("[CLOB] ✅ 通过 slug=%s 解析到 market_id=%s", slug, resolved_market_id)
+            else:
+                logger.warning("[CLOB] ❌ slug=%s 未能解析到 market_id", slug)
+        if not resolved_market_id:
+            logger.warning("[CLOB] 无法解析 market_id (market_id=%s, slug=%s)", market_id, slug)
+            return None
+        url = f"{self.POLYMARKET_CLOB_URL}/{resolved_market_id}"
+        logger.info("[CLOB] 请求 CLOB API: %s", url)
+        timeout = aiohttp.ClientTimeout(total=4)
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=timeout) as response:
+                    if response.status != 200:
+                        logger.warning("[CLOB] ❌ %s status=%s", url, response.status)
+                        return None
+                    payload = await response.json()
+                    logger.info("[CLOB] payload keys=%s", list(payload.keys()))
+        except Exception as exc:
+            logger.warning("[CLOB] 请求失败 (%s): %s", url, exc)
+            return None
+
+        def _finalize(prob: Optional[float], source: str, raw: Any = None) -> Optional[float]:
+            if prob is None:
+                return None
+            if prob <= 0.0:
+                logger.debug("[CLOB] %s 返回非正概率 (%s)，忽略", source, prob)
+                return None
+            logger.debug("[CLOB] 使用 %s=%s -> %.2f%%", source, raw if raw is not None else prob, prob)
+            return prob
+
+        yes_prob = self._convert_price_to_percentage(payload.get("yesPrice"))
+        finalized = _finalize(yes_prob, "yesPrice", payload.get("yesPrice"))
+        if finalized is not None:
+            return finalized
+
+        no_prob = self._convert_price_to_percentage(payload.get("noPrice"))
+        if no_prob is not None:
+            converted = max(0.0, min(100.0, 100.0 - no_prob))
+            finalized = _finalize(converted, "noPrice", payload.get("noPrice"))
+            if finalized is not None:
+                return finalized
+
+        book = payload.get("book") or {}
+
+        def _lookup(key: str) -> Any:
+            if key in payload and payload.get(key) is not None:
+                return payload.get(key)
+            return book.get(key)
+
+        bid_value = _lookup("bestBid") or _lookup("bid")
+        ask_value = _lookup("bestAsk") or _lookup("ask")
+        if bid_value is not None and ask_value is not None:
+            try:
+                mid = (float(bid_value) + float(ask_value)) / 2
+                mid_prob = self._convert_price_to_percentage(mid)
+                finalized = _finalize(mid_prob, "mid(book)", f"{bid_value}/{ask_value}")
+                if finalized is not None:
+                    return finalized
+            except (TypeError, ValueError):
+                pass
+
+        fallback_fields = (
+            "lastTradePrice",
+            "lastPrice",
+            "currentPrice",
+            "mid",
+            "price",
+        )
+        for field in fallback_fields:
+            prob = self._convert_price_to_percentage(_lookup(field))
+            finalized = _finalize(prob, field)
+            if finalized is not None:
+                return finalized
+
+        logger.warning("[CLOB] ❌ 无法从 %s 获取有效概率", resolved_market_id)
+        return None
+
+    def _convert_price_to_percentage(self, value: Optional[Any]) -> Optional[float]:
+        """Normalize diverse price formats to 0-100 probability."""
+        if value is None:
+            return None
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return None
+        if numeric < 0:
+            return None
+        probability = numeric * 100 if numeric <= 1 else numeric
+        if probability > 1000:  # Guard against obviously invalid data
+            return None
+        return round(min(probability, 100.0), 4)
     
     def _parse_market_data(self, market: Dict) -> Dict:
         """Parse market data from Polymarket API response (GraphQL/legacy)."""
@@ -2097,7 +2644,6 @@ class EventManager:
                         f"{context}.outcome.{outcome.get('name', 'unknown')}.probability"
                     ) or 0.0
         payload.setdefault("question", payload.get("title", "Unknown event"))
-        payload.setdefault("market_prob", 0.0)
         try:
             event_model = Event(**payload)
             return event_model.model_dump()
@@ -2146,13 +2692,20 @@ class EventManager:
         event_query: str,
         slug: Optional[str],
         session: Optional[aiohttp.ClientSession] = None
-    ) -> Optional[Dict]:
+    ) -> Tuple[Optional[Dict], Optional[Dict]]:
         """
         Fetch multiple Polymarket sources concurrently to reduce latency.
+
+        Returns:
+            (payload_with_probability, best_effort_payload_without_probability)
         """
         if session is None:
             async with aiohttp.ClientSession() as managed_session:
-                return await self._fetch_primary_sources_concurrently(event_query, slug, session=managed_session)
+                return await self._fetch_primary_sources_concurrently(
+                    event_query,
+                    slug,
+                    session=managed_session
+                )
         
         fetchers = []
         if slug:
@@ -2161,12 +2714,34 @@ class EventManager:
         fetchers.append(self._fetch_via_graphql(session, event_query, slug))
         
         results = await asyncio.gather(*fetchers, return_exceptions=True)
+        payloads: List[Dict[str, Any]] = []
         for result in results:
             if isinstance(result, dict) and result:
-                return result
-            if isinstance(result, Exception):
+                payloads.append(result)
+            elif isinstance(result, Exception):
                 print(f"[EventManager] concurrent fetch error: {result}")
-        return None
+        payload_with_prob: Optional[Dict] = None
+        fallback_payload: Optional[Dict] = None
+        for payload in payloads:
+            if fallback_payload is None:
+                fallback_payload = payload
+            if self._has_positive_probability(payload):
+                payload_with_prob = payload
+                break
+        if payload_with_prob:
+            return payload_with_prob, None
+        return None, fallback_payload
+
+    @staticmethod
+    def _has_positive_probability(payload: Optional[Dict[str, Any]]) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        value = payload.get("market_prob")
+        try:
+            prob = float(value)
+        except (TypeError, ValueError):
+            return False
+        return prob > 0.0
 
     async def _fetch_via_slug(
         self,
@@ -2180,11 +2755,13 @@ class EventManager:
         if not data or not isinstance(data, list):
             return None
         event = data[0]
+        markets = event.get("markets")
+        first_market = markets[0] if isinstance(markets, list) and markets else None
         payload = {
             "question": event.get("question") or event.get("title"),
             "rules": event.get("rules"),
-            "market_prob": self._extract_market_probability(event.get("markets", [{}])[0]) if event.get("markets") else 0.0,
-            "outcomes": event.get("markets") or [],
+            "market_prob": self._extract_market_probability(first_market),
+            "outcomes": markets or [],
             "slug": slug,
             "source": "concurrent_slug"
         }
@@ -2255,10 +2832,10 @@ class EventManager:
         }
         return self._validate_event_payload(payload, "concurrent_graphql")
 
-    def _extract_market_probability(self, market: Optional[Dict[str, Any]]) -> float:
+    def _extract_market_probability(self, market: Optional[Dict[str, Any]]) -> Optional[float]:
         """Extract Yes probability from generic Polymarket payload."""
         if not isinstance(market, dict):
-            return 0.0
+            return None
         prob = None
         if "yesPrice" in market:
             prob = market.get("yesPrice")
@@ -2270,16 +2847,22 @@ class EventManager:
                 if name in {"yes", "y"}:
                     prob = outcome.get("price")
                     break
-            if prob is None:
+            if prob is None and isinstance(market["outcomes"], list) and market["outcomes"]:
                 first = market["outcomes"][0]
                 prob = first.get("price")
+        if prob is None:
+            return None
         try:
             value = float(prob)
-            if value <= 1:
-                value *= 100
-            return value
         except (TypeError, ValueError):
-            return 0.0
+            return None
+        if value < 0:
+            return None
+        if value <= 1:
+            value *= 100
+        if value <= 0.0 or value > 1000:
+            return None
+        return round(min(value, 100.0), 4)
 
     def _calculate_days_left(self, end_date_str: str) -> int:
         """Calculate days until market resolution."""

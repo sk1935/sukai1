@@ -166,5 +166,13 @@
     "sample_count": 20,
     "source": "GDELT",
     "timestamp": "2025-11-07T22:05:18.988424"
+  },
+  "mamdani freeze nyc": {
+    "keyword": "mamdani freeze nyc",
+    "sentiment": "neutral",
+    "score": 0.0,
+    "sample_count": 20,
+    "source": "GDELT",
+    "timestamp": "2025-11-08T20:41:59.251336"
   }
 }

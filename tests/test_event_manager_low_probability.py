@@ -8,7 +8,8 @@ def event_manager():
     return EventManager()
 
 
-def test_filter_low_probability_event_returns_details(event_manager, caplog):
+@pytest.mark.asyncio
+async def test_filter_low_probability_event_returns_details(event_manager, caplog):
     event_data = {
         "question": "Test Event",
         "outcomes": [
@@ -18,7 +19,7 @@ def test_filter_low_probability_event_returns_details(event_manager, caplog):
     }
 
     with caplog.at_level("WARNING"):
-        decision = event_manager.filter_low_probability_event(event_data, threshold=1.0)
+        decision = await event_manager.filter_low_probability_event(event_data, threshold=1.0)
 
     assert decision is not None
     assert decision["max_probability"] == pytest.approx(0.8)
@@ -26,7 +27,8 @@ def test_filter_low_probability_event_returns_details(event_manager, caplog):
     assert any("过滤事件" in record.message for record in caplog.records)
 
 
-def test_filter_low_probability_event_allows_higher_probability(event_manager):
+@pytest.mark.asyncio
+async def test_filter_low_probability_event_allows_higher_probability(event_manager):
     event_data = {
         "question": "Another Event",
         "outcomes": [
@@ -35,13 +37,13 @@ def test_filter_low_probability_event_allows_higher_probability(event_manager):
         ],
     }
 
-    decision = event_manager.filter_low_probability_event(event_data, threshold=5.0)
+    decision = await event_manager.filter_low_probability_event(event_data, threshold=5.0)
 
     assert decision is None
 
 
-def test_filter_low_probability_event_handles_missing_data(event_manager):
+@pytest.mark.asyncio
+async def test_filter_low_probability_event_handles_missing_data(event_manager):
     event_data = {"question": "No Probabilities"}
 
-    assert event_manager.filter_low_probability_event(event_data, threshold=5.0) is None
-
+    assert await event_manager.filter_low_probability_event(event_data, threshold=5.0) is None

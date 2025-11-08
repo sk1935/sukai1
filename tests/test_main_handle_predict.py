@@ -18,7 +18,7 @@ class StubEventManager:
     async def fetch_polymarket_data(self, event_info):
         return {"question": "Stub Event", "outcomes": [{"model_only_prob": 0.5}]}
 
-    def filter_low_probability_event(self, event_data, threshold=None):
+    async def filter_low_probability_event(self, event_data, threshold=None):
         return self.filter_response
 
     def _create_mock_market_data(self, query):
@@ -122,4 +122,3 @@ async def test_handle_predict_logs_and_returns_error(caplog):
     assert any("handle_predict 处理异常" in record.message for record in caplog.records)
     reply_text, _ = message.replies[-1]
     assert reply_text.startswith("error:")
-

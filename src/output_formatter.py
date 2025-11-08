@@ -1099,6 +1099,9 @@ class OutputFormatter:
         
         # ===== 候选人型事件：保持原有格式 =====
         
+        # 初始化 finalized_summary_text，避免 UnboundLocalError
+        finalized_summary_text = ""
+        
         # Sort outcomes by normalized AI prediction (descending)
         # 使用归一化后的 model_only_prob 进行排序
         sorted_outcomes = sorted(

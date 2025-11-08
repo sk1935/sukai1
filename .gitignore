@@ -40,6 +40,10 @@ Thumbs.db
 # Logs
 *.log
 
+# Process IDs
+*.pid
+sync.pid
+
 
 
 

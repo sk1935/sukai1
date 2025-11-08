@@ -1,23 +1,37 @@
 """
-OpenRouter 助手 - 新闻摘要生成
+OpenRouter 助手 - 新闻摘要生成（支持多层备用模型 Fallback Chain）
 
 功能：
-- 使用 OpenRouter 免费模型生成新闻摘要
+- 使用多层备用模型生成新闻摘要
+- Fallback Chain: OpenRouter → Cohere → TextRazor
 - 输入：news_cache 的最新新闻（前 10 条）
 - 输出：综合摘要文本，保存到 cache/news_summary.txt
 """
 import asyncio
 import os
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, List, Dict
 import sys
+import aiohttp
 
 # 添加项目根目录到路径
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
+# 配置
 OPENROUTER_ASSISTANT_ENABLED = os.getenv("OPENROUTER_ASSISTANT_ENABLED", "false").lower() == "true"
+COHERE_API_KEY = os.getenv("COHERE_API_KEY", "")
+TEXTRAZOR_API_KEY = os.getenv("TEXTRAZOR_API_KEY", "")
+
+# 日志配置
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
 
 # 相对导入（同目录）
 from src.news_cache import get_cached_news
@@ -50,6 +64,170 @@ SUMMARY_FILE = CACHE_DIR / "news_summary.txt"
 def ensure_cache_dir():
     """确保缓存目录存在"""
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+async def call_cohere_api(prompt: str) -> Dict[str, str]:
+    """
+    调用 Cohere API 生成文本
+    
+    Args:
+        prompt: 输入提示词
+    
+    Returns:
+        Dict with "text" key containing the generated text
+    
+    Raises:
+        Exception: 如果API调用失败
+    """
+    if not COHERE_API_KEY:
+        raise ValueError("COHERE_API_KEY not configured")
+    
+    url = "https://api.cohere.ai/v1/generate"
+    headers = {
+        "Authorization": f"Bearer {COHERE_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": "command-xlarge-nightly",
+        "prompt": prompt,
+        "max_tokens": 300,
+        "temperature": 0.7
+    }
+    
+    timeout = aiohttp.ClientTimeout(total=20)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(url, headers=headers, json=payload) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+            text = data.get("generations", [{}])[0].get("text", "").strip()
+            if not text:
+                raise ValueError("Cohere returned empty response")
+            return {"text": text, "source": "cohere"}
+
+
+async def call_textrazor_api(prompt: str) -> Dict[str, str]:
+    """
+    调用 TextRazor API 提取关键信息
+    
+    Args:
+        prompt: 输入文本
+    
+    Returns:
+        Dict with "text" key containing extracted entities and topics
+    
+    Raises:
+        Exception: 如果API调用失败
+    """
+    if not TEXTRAZOR_API_KEY:
+        raise ValueError("TEXTRAZOR_API_KEY not configured")
+    
+    url = "https://api.textrazor.com"
+    headers = {"x-textrazor-key": TEXTRAZOR_API_KEY}
+    data = {
+        "text": prompt[:2000],  # TextRazor 有长度限制
+        "extractors": "entities,topics"
+    }
+    
+    timeout = aiohttp.ClientTimeout(total=20)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(url, headers=headers, data=data) as resp:
+            resp.raise_for_status()
+            result = await resp.json()
+            
+            # 提取实体和主题
+            response_data = result.get("response", {})
+            entities = [e.get("entityId", "") for e in response_data.get("entities", [])]
+            topics = [t.get("label", "") for t in response_data.get("topics", [])]
+            
+            # 合并结果
+            combined = ", ".join(filter(None, (entities[:5] + topics[:5])))
+            if not combined:
+                raise ValueError("TextRazor returned no entities or topics")
+            
+            summary_text = f"🧩 关键主题: {combined}"
+            return {"text": summary_text, "source": "textrazor"}
+
+
+async def run_with_fallback(prompt: str) -> Dict[str, str]:
+    """
+    使用多层备用模型调用链
+    
+    Fallback Chain: OpenRouter → Cohere → TextRazor
+    
+    Args:
+        prompt: 输入提示词
+    
+    Returns:
+        Dict with "text" key containing the generated text and "source" key
+    """
+    # 1. 尝试 OpenRouter
+    try:
+        logger.info("[Fallback] 尝试 OpenRouter...")
+        api_key = os.getenv("OPENROUTER_API_KEY")
+        if not api_key:
+            raise ValueError("OPENROUTER_API_KEY not configured")
+        
+        import httpx
+        timeout_seconds = 20.0
+        
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://polymarket-predictor.com",
+            "X-Title": "Polymarket AI Predictor"
+        }
+        
+        # 使用快速模型
+        payload = {
+            "model": "mistralai/mistral-7b-instruct",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.7,
+            "max_tokens": 1000
+        }
+        
+        async with httpx.AsyncClient(timeout=httpx.Timeout(timeout_seconds)) as client:
+            response = await client.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                json=payload,
+                headers=headers
+            )
+            response.raise_for_status()
+            data = response.json()
+            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            
+            if content:
+                logger.info("[Fallback] ✅ OpenRouter 成功")
+                return {"text": content.strip(), "source": "openrouter"}
+            else:
+                raise ValueError("OpenRouter returned empty content")
+                
+    except Exception as e1:
+        logger.warning(f"[Fallback] ❌ OpenRouter 失败: {type(e1).__name__}: {str(e1)[:100]}")
+    
+    # 2. 尝试 Cohere
+    try:
+        logger.info("[Fallback] 尝试 Cohere...")
+        result = await call_cohere_api(prompt)
+        logger.info("[Fallback] ✅ Cohere 成功")
+        return result
+    except Exception as e2:
+        logger.warning(f"[Fallback] ❌ Cohere 失败: {type(e2).__name__}: {str(e2)[:100]}")
+    
+    # 3. 尝试 TextRazor
+    try:
+        logger.info("[Fallback] 尝试 TextRazor...")
+        result = await call_textrazor_api(prompt)
+        logger.info("[Fallback] ✅ TextRazor 成功")
+        return result
+    except Exception as e3:
+        logger.error(f"[Fallback] ❌ TextRazor 失败: {type(e3).__name__}: {str(e3)[:100]}")
+    
+    # 4. 所有模型都失败，返回默认响应
+    logger.error("[Fallback] ❌ 所有模型调用失败，返回默认响应")
+    return {
+        "text": "[⚠️] 所有模型调用失败。无法生成新闻摘要。",
+        "source": "fallback_default"
+    }
 
 
 def build_summary_prompt(news_list: List[Dict]) -> str:
@@ -91,7 +269,7 @@ def build_summary_prompt(news_list: List[Dict]) -> str:
 
 async def generate_news_summary(force_refresh: bool = False) -> Optional[str]:
     """
-    生成新闻摘要
+    生成新闻摘要（支持多层备用模型 Fallback Chain）
     
     Args:
         force_refresh: 是否强制刷新（忽略已存在的摘要）
@@ -100,11 +278,7 @@ async def generate_news_summary(force_refresh: bool = False) -> Optional[str]:
         str: 生成的摘要文本，失败返回 None
     """
     if not OPENROUTER_ASSISTANT_ENABLED:
-        print("🛑 [OPENROUTER_ASSISTANT] 功能已禁用，跳过摘要生成")
-        return None
-    
-    if not OPENROUTER_LAYER_AVAILABLE:
-        print("🛑 [OPENROUTER_ASSISTANT] OpenRouter 层不可用")
+        logger.info("🛑 [OPENROUTER_ASSISTANT] 功能已禁用，跳过摘要生成")
         return None
     
     # 检查是否已有摘要且未过期
@@ -115,118 +289,53 @@ async def generate_news_summary(force_refresh: bool = False) -> Optional[str]:
             now = datetime.now(timezone.utc)
             
             if (now - file_time).total_seconds() < 6 * 3600:  # 6小时有效期
-                print(f"✅ 使用缓存的新闻摘要（剩余有效期：{int((6 * 3600 - (now - file_time).total_seconds()) / 3600)} 小时）")
+                remaining_hours = int((6 * 3600 - (now - file_time).total_seconds()) / 3600)
+                logger.info(f"✅ 使用缓存的新闻摘要（剩余有效期：{remaining_hours} 小时）")
                 with open(SUMMARY_FILE, 'r', encoding='utf-8') as f:
                     return f.read()
         except Exception as e:
-            print(f"⚠️ 读取缓存摘要失败: {e}")
-    
-    # 检查 OpenRouter 是否可用
-    if not is_openrouter_available():
-        print("⚠️ OpenRouter API 不可用，跳过摘要生成")
-        return None
-    
-    # 获取可用模型
-    available_models = get_available_models()
-    if not available_models:
-        print("⚠️ 没有可用的 OpenRouter 模型")
-        return None
+            logger.warning(f"⚠️ 读取缓存摘要失败: {e}")
     
     # 获取缓存的新闻
     news_list = get_cached_news()
     if not news_list:
-        print("⚠️ 没有可用的新闻数据，无法生成摘要")
+        logger.warning("⚠️ 没有可用的新闻数据，无法生成摘要")
         return None
     
-    print(f"📝 开始生成新闻摘要（使用 {len(news_list)} 条新闻）...")
+    logger.info(f"📝 开始生成新闻摘要（使用 {len(news_list)} 条新闻）...")
     
     # 构建提示词
     prompt = build_summary_prompt(news_list)
     
-    # 尝试多个模型（按优先级）
-    models_to_try = [
-        "meta-llama/llama-3-70b-instruct",  # 首选：Llama-3-70B
-        "mistralai/mistral-7b-instruct",   # 备选：Mistral-7B
-        "yi-large/yi-1.5-chat"            # 备选：Yi-Large
-    ]
-    
-    summary = None
-    
-    for model_name in models_to_try:
-        if model_name not in available_models:
-            continue
-        
-        try:
-            print(f"🤖 尝试使用模型: {model_name}")
-            
-            # 对于摘要任务，我们需要直接获取原始文本响应
-            # 调用 OpenRouter API 获取原始响应
-            api_key = os.getenv("OPENROUTER_API_KEY")
-            if not api_key:
-                print("⚠️ OPENROUTER_API_KEY 未设置")
-                continue
-            
-            import httpx
-            timeout_seconds = 35.0
-            
-            headers = {
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": "https://polymarket-predictor.com",
-                "X-Title": "Polymarket AI Predictor"
-            }
-            
-            payload = {
-                "model": model_name,
-                "messages": [
-                    {"role": "user", "content": prompt}
-                ],
-                "temperature": 0.7,
-                "max_tokens": 1000  # 增加 token 限制以获取完整摘要
-            }
-            
-            async with httpx.AsyncClient(timeout=httpx.Timeout(timeout_seconds)) as client:
-                response = await client.post(
-                    "https://openrouter.ai/api/v1/chat/completions",
-                    json=payload,
-                    headers=headers
-                )
-                
-                if response.status_code == 200:
-                    data = response.json()
-                    content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-                    
-                    if content:
-                        summary = content.strip()
-                        print(f"✅ 成功使用 {model_name} 生成摘要（{len(summary)} 字符）")
-                        break
-                    else:
-                        print(f"⚠️ {model_name} 返回空内容")
-                else:
-                    print(f"❌ {model_name} API 错误: {response.status_code}")
-                    error_text = response.text[:200]
-                    print(f"   错误详情: {error_text}")
-                    
-        except Exception as e:
-            print(f"⚠️ {model_name} 调用失败: {type(e).__name__}: {e}")
-            continue
-    
-    if not summary:
-        print("❌ 所有模型调用失败，无法生成摘要")
-        return None
-    
-    # 保存摘要到文件
+    # 使用 Fallback Chain 调用模型
     try:
-        ensure_cache_dir()
-        with open(SUMMARY_FILE, 'w', encoding='utf-8') as f:
-            f.write(summary)
+        result = await run_with_fallback(prompt)
+        summary = result.get("text", "")
+        source = result.get("source", "unknown")
         
-        print(f"✅ 新闻摘要已保存: {SUMMARY_FILE}")
-        return summary
+        if not summary or summary.startswith("[⚠️]"):
+            # 如果是默认fallback响应，返回None
+            logger.error("❌ 所有模型调用失败，无法生成摘要")
+            return None
         
+        logger.info(f"✅ 成功生成摘要（来源: {source}，{len(summary)} 字符）")
+        
+        # 保存摘要到文件
+        try:
+            ensure_cache_dir()
+            with open(SUMMARY_FILE, 'w', encoding='utf-8') as f:
+                f.write(summary)
+            
+            logger.info(f"✅ 新闻摘要已保存: {SUMMARY_FILE}")
+            return summary
+            
+        except Exception as e:
+            logger.error(f"❌ 保存摘要失败: {e}")
+            return summary  # 即使保存失败，也返回摘要内容
+    
     except Exception as e:
-        print(f"❌ 保存摘要失败: {e}")
-        return summary  # 即使保存失败，也返回摘要内容
+        logger.error(f"❌ Fallback chain 执行失败: {type(e).__name__}: {e}")
+        return None
 
 
 async def get_news_summary() -> Optional[str]:
@@ -246,5 +355,8 @@ __all__ = [
     "generate_news_summary",
     "get_news_summary",
     "build_summary_prompt",
+    "run_with_fallback",
+    "call_cohere_api",
+    "call_textrazor_api",
     "SUMMARY_FILE"
 ]
